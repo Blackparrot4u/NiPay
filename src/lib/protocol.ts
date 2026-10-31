@@ -3,9 +3,9 @@
 // the trailing checksum only catches scanning damage.
 import { concat, enc, dec, sha256b, randomBytes } from './crypto';
 
-export type MsgType = 'card' | 'payment' | 'receipt' | 'refuse';
-const TYPE: Record<MsgType, number> = { card: 0, payment: 1, receipt: 2, refuse: 3 };
-const NAME = ['card', 'payment', 'receipt', 'refuse'] as MsgType[];
+export type MsgType = 'card' | 'payment' | 'receipt' | 'refuse' | 'offer' | 'answer';
+const TYPE: Record<MsgType, number> = { card: 0, payment: 1, receipt: 2, refuse: 3, offer: 4, answer: 5 };
+const NAME = ['card', 'payment', 'receipt', 'refuse', 'offer', 'answer'] as MsgType[];
 
 export interface PayPoint { pid: string; sig: Uint8Array; handover: Uint8Array }
 export interface RcptPoint { pid: string; receipt: Uint8Array }
@@ -13,7 +13,10 @@ export type Message =
   | { type: 'card'; meta: { phone: string; name: string; pk: string; kyc: boolean; nonce: string } }
   | { type: 'payment'; meta: { ref: string; month: string; from: string; fromName: string; to: string; ts: number; pk: string }; points: PayPoint[] }
   | { type: 'receipt'; meta: { ref: string; from: string; to: string; ts: number }; points: RcptPoint[] }
-  | { type: 'refuse'; meta: { ref: string; reason: string } };
+  | { type: 'refuse'; meta: { ref: string; reason: string } }
+  | { type: 'offer'; meta: { sdp: CompactSdp; epk: string; dpk: string; key: string } }
+  | { type: 'answer'; meta: { sdp: CompactSdp; epk: string; dpk: string; sig: string } };
+export interface CompactSdp { u: string; p: string; f: string; c: string[] }
 
 export function encodeMessage(m: Message): Uint8Array {
   const meta = enc.encode(JSON.stringify(m.meta));

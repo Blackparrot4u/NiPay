@@ -19,12 +19,12 @@ process.on('exit', stop);
 for (let i = 0; i < 60; i++) { try { if ((await fetch(BASE + '/api/health')).ok) break; } catch {} await new Promise((r) => setTimeout(r, 500)); }
 if (!(await fetch(BASE + '/api/health').then((r) => r.ok).catch(() => false))) { console.log('SERVER LOG', log); process.exit(2); }
 const secrets = JSON.parse(readFileSync(join(dataDir, 'secrets.json'), 'utf8'));
-const browser = await chromium.launch();
+const browser = await chromium.launch({ args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
 const results = [];
 const step = async (name, f) => { try { await f(); results.push(['PASS', name]); console.log('PASS', name); } catch (e) { for (const [i, x] of [A, B, C].entries()) await x.page.screenshot({ path: join(SHOTS, 'fail-' + i + '.png') }).catch(() => {}); results.push(['FAIL', name + ': ' + e.message.split('\n')[0] + ' @' + (e.stack.match(/e2e.mjs:(\d+)/)||[])[1]]); console.log('FAIL', name, e.message.split('\n')[0]); } };
 const newPhone = async (viewport = { width: 390, height: 800 }) => { const ctx = await browser.newContext({ viewport, permissions: [] }); const page = await ctx.newPage(); page.on('pageerror', (e) => console.log('PAGE ERROR', e.message)); return { ctx, page }; };
 const shot = (p, n) => p.screenshot({ path: join(SHOTS, n + '.png') });
-const frames = async (p) => p.locator('[data-testid=qr]').first().getAttribute('data-frames');
+const frames = async (p) => { for (let i = 0; i < 60; i++) { const v = await p.locator('[data-testid=qr]').first().getAttribute('data-frames').catch(() => null); if (v && v.length > 4) return v; await p.waitForTimeout(250); } throw new Error('no frames'); };
 const inject = async (p, json) => { const d = p.locator('details').first(); if (!(await d.evaluate((e) => e.open))) await d.locator('summary').click(); await p.getByTestId('debug-paste').fill(json); await p.getByTestId('debug-inject').click(); };
 const text = (p, id) => p.getByTestId(id).innerText();
 
@@ -81,6 +81,22 @@ await step('sync: money moves only now; A 12 in slot, B receive bucket 8, histor
   await B.page.goto(BASE + '/#/history'); await B.page.getByTestId('hist-row').first().waitFor();
   assert.match(await B.page.getByTestId('hist-row').first().innerText(), /paid/); await shot(B.page, '05-history-paid');
   await B.page.goto(BASE + '/#/move'); await B.page.getByTestId('mv-submit').click(); await B.page.getByText('Moved to your main account').waitFor(); await shot(B.page, '06-move-to-main');
+});
+await step('wifi link: A pays B 4 points over a real WebRTC data channel (offer/answer by QR, no server), a forged frame is rejected, then keys die', async () => {
+  await A.page.goto(BASE + '/#/'); await B.page.goto(BASE + '/#/'); await A.page.evaluate(() => { localStorage.setItem('nipay:debug', '1'); window.__nipayForgeOnOpen = true; });
+  await B.page.goto(BASE + '/#/receive'); await A.page.goto(BASE + '/#/pay'); await B.page.getByTestId('qr').waitFor(); await inject(A.page, await frames(B.page));
+  await A.page.getByTestId('pay-amount').fill('4'); await A.page.getByTestId('pay-pin').fill('1234'); await A.page.getByTestId('pay-link').click(); await A.page.getByTestId('qr').waitFor();
+  await B.page.getByTestId('rcv-scan').click(); await inject(B.page, await frames(A.page));
+  await B.page.getByTestId('link-state').waitFor(); await shot(B.page, '16-wifi-link-answer');
+  await B.page.getByTestId('qr').waitFor(); const ans = await frames(B.page);
+  await A.page.getByTestId('offer-next').click(); await inject(A.page, ans);
+  await B.page.getByTestId('rcv-amount').waitFor({ timeout: 20000 });
+  assert.equal(await text(B.page, 'match-code'), await text(A.page, 'match-code'));
+  assert.ok(Number(await text(B.page, 'link-rejected')) >= 1, 'forged frame was rejected by the link');
+  await shot(B.page, '17-wifi-link-review');
+  await B.page.getByTestId('rcv-accept').click(); await A.page.getByText('encrypted wifi link').waitFor({ timeout: 15000 }); await shot(A.page, '18-wifi-link-done');
+  assert.equal(await A.page.evaluate(() => window.__nipayLink.state), 'destroyed');
+  await A.page.evaluate(() => { window.__nipayForgeOnOpen = false; }); await home(A.page); assert.equal(await text(A.page, 'send-bal'), '8');
 });
 await step('double spend: wallet snapshot restored, same points handed to Chand; bank pays first, holds second', async () => {
   // A saves a copy of the wallet, pays Bela, restores the copy and pays Chand with the same points
