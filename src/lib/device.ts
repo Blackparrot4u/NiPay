@@ -82,7 +82,7 @@ export function policy(month: string): { send: number; recv: number; grace: numb
 export function acceptRulesDoc(doc: Docs): boolean {
   const pub = bankPubBytes();
   if (!pub.length || !acceptSigned(pub, doc.rules) || !acceptSigned(pub, doc.mine) || !acceptSigned(pub, doc.policy)) return false;
-  set((s) => ({ docs: [doc, ...s.docs.filter((d) => d.month !== doc.month)].slice(0, 2) }));
+  set((s) => ({ docs: [doc, ...s.docs.filter((d) => d.month !== doc.month)].sort((a, b) => b.month.localeCompare(a.month)).slice(0, 2) }));
   return true;
 }
 export const currentMonth = () => [...state.docs].map((d) => d.month).sort().pop() ?? '';
@@ -190,7 +190,10 @@ export async function syncNow(round = 0): Promise<SyncResult> {
     const r = await api('/sync', { body: { logs, reports: s0.queuedReports, cross_reports: sentReports, wallet, client_time: new Date().toISOString() }, token: s0.token });
     // adopt bank-signed documents only if the signatures are good
     let rejectedDocs = 0;
-    for (const d of [r.rules]) if (!acceptRulesDoc(d)) rejectedDocs++;
+    // previous month first, current last: only documents the bank signed are adopted; then months the bank no longer lists (out of grace) are dropped
+    for (const d of [r.previous_rules, r.rules]) if (d && !acceptRulesDoc(d)) rejectedDocs++;
+    const keep = new Set<string>([r.rules.month, r.previous_rules?.month].filter(Boolean));
+    if (!rejectedDocs) set((s) => ({ docs: s.docs.filter((d) => keep.has(d.month)) }));
     const nb = acceptSigned(bankPubBytes(), r.notices);
     const results: any[] = r.results;
     const byPid = new Map(results.map((x) => [x.pid, x]));

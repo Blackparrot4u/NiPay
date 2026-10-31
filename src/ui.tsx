@@ -16,7 +16,7 @@ export function useT() {
 }
 export const setLanguage = (l: 'en' | 'hi') => set({ language: l });
 
-export { Card, Btn, Field, Badge, Title, Err, Notice } from './shared/atoms';
+export { Card, Btn, Field, Badge, Title, Err, Notice, Stat } from './shared/atoms';
 export const go = (path: string) => { location.hash = path; };
 
 export function beep(ms = 220, freq = 880) {
@@ -35,7 +35,7 @@ export const errText = (e: any) => {
   const d = e?.detail;
   const code = typeof d === 'string' ? d : d?.code ?? e?.message ?? 'error';
   const map: Record<string, string> = { bad_credentials: 'Wrong phone or PIN.', bad_otp: 'Wrong demo OTP.', terms_required: 'Please accept both terms.', send_limit: 'That is above the 2,000-point send limit.',
-    insufficient: 'Not enough balance (the Rs 1 fee is included).', phone_already_registered: 'That phone number is already registered. Sign in instead.', offline_suspended: 'Offline use is suspended on this account. File an appeal in More.',
-    too_many_wrong_pins: 'Too many wrong PINs. Try again in 15 minutes.', offline: 'No internet connection.', rate_limited: 'Slow down: too many requests.', bad_pin: 'Wrong PIN.', this_device_was_cancelled: 'This device was cancelled. Register again from a new device.' };
+    insufficient: 'Not enough balance (the ₹1 fee is included).', phone_already_registered: 'That phone number is already registered. Sign in instead.', offline_suspended: 'Offline use is suspended on this account. File an appeal in More.',
+    too_many_wrong_pins: 'Too many wrong PINs. Try again in 15 minutes.', offline: 'No internet connection.', rate_limited: 'Slow down: too many requests.', bad_pin: 'Wrong PIN.', sync_first: 'Some payments are not at the bank yet. Sync first (needs internet), then add points.', this_device_was_cancelled: 'This device was cancelled. Register again from a new device.' };
   return map[code] ?? code.replace(/_/g, ' ');
 };
