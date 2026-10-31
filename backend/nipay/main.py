@@ -19,6 +19,7 @@ from .models import (Appeal, AuditLog, CrossReport, Device, LedgerEntry, Notice,
 from .security import PinGuard, RateLimiter, check_pin, hash_pin, hash_token, new_token
 from .service import Rejected, Svc, b64, unb64
 
+SYNC_BATCH = 2500
 PHONE_RE = re.compile(r"^\+?[0-9]{10,13}$")
 TRIPWIRES = {"forged", "landmine", "tower", "code_check", "restore", "control_key_leak", "root"}
 BANKS = ("Demo Bank A", "Demo Bank B", "Demo Bank C")  # fictional; no real bank names or logos
@@ -61,6 +62,7 @@ class CancelIn(LoginIn):
 class TopupIn(BaseModel):
     amount: int
     pin: str
+    unsynced_spent: int = 0  # points this phone spent offline and has not synced yet
 
 
 class MoveIn(BaseModel):
@@ -72,6 +74,7 @@ class SyncIn(BaseModel):
     reports: list[dict] = []
     wallet: dict | None = None
     cross_reports: list[dict] = []
+    code_digest: str = ""
     client_time: str = ""
 
 
@@ -196,7 +199,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         return {"id": u.id, "name": u.name, "phone": u.phone, "bank": u.bank, "region": u.region, "language": u.language,
                 "kyc_status": u.kyc_status, "kyc_note": "test data only; no real Aadhaar/PAN is stored",
                 "main_balance": u.main_balance, "send_bucket": u.send_bucket, "receive_bucket": u.receive_bucket,
-                "send_limit": st.send_limit, "receive_limit": st.receive_limit, "topup_fee": st.topup_fee, "offline_suspended": u.offline_suspended,
+                "send_limit": svc.send_limit_for(db, dev), "receive_limit": st.receive_limit, "topup_fee": st.topup_fee, "offline_suspended": u.offline_suspended,
                 "suspend_reason": u.suspend_reason, "month": cur, "days_until_renewal": max(0, (nxt - datetime.now(timezone.utc)).days),
                 "grace_days": st.grace_days, "pending_transfers": pending,
                 "last_sync_at": u.last_sync_at.isoformat() if u.last_sync_at else None,
@@ -329,7 +332,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         if not check_pin(body.pin, ctx.user.pin_hash):
             bad("bad_pin", 403)
         try:
-            pts = svc.topup(ctx.db, ctx.user, ctx.device, body.amount)
+            pts = svc.topup(ctx.db, ctx.user, ctx.device, body.amount, body.unsynced_spent)
         except Rejected as r:
             ctx.db.rollback()
             bad(r.code)
@@ -349,7 +352,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
     # ---------- sync and claims ----------
     def run_logs(ctx: Ctx, logs: list) -> list:
         out = []
-        for e in logs[:2500]:
+        for e in logs[:SYNC_BATCH]:
             role = "claimant" if e.get("role") in ("received", "claimant") else "sender"
             try:
                 out.append(svc.process_transfer(ctx.db, ctx.user, role, e))
@@ -361,11 +364,19 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
     def sync(body: SyncIn, ctx: Ctx = Depends(user_ctx)):
         db, u = ctx.db, ctx.user
         results = run_logs(ctx, body.logs)
+        more = len(body.logs) > SYNC_BATCH   # the phone sends the rest in its next round
+        svc.sudden_change(db, u, sum(1 for r in results if r.get("status") == "paid"))
         for r in body.reports[:50]:
             t = str(r.get("type", ""))
             if t in TRIPWIRES:
                 svc.event(db, t, "MEDIUM", u.id, str(r.get("pid", ""))[:20], str(r.get("description", ""))[:300], source="phone")
-        problems = svc.audit_wallet(db, u, ctx.device, body.wallet) if body.wallet else []
+        if body.wallet:
+            svc.note_counter(db, ctx.device, body.wallet)
+            problems = svc.audit_wallet(db, u, ctx.device, body.wallet)
+        else:  # leaving the snapshot out must not skip the audit silently
+            problems = ["wallet_omitted"]
+            svc.event(db, "wallet_omitted", "MEDIUM", u.id, "", "sync arrived without a wallet snapshot, so no restore or mine audit was possible", source="phone")
+        code_check = svc.check_build(db, u, body.code_digest)
         cross = svc.ingest_cross_reports(db, u, ctx.device, body.cross_reports, problems)
         u.last_sync_at = now()
         db.add(Report(user_id=u.id, kind="sync", detail=json.dumps({"logs": len(body.logs), "reports": len(body.reports), "problems": problems})))
@@ -373,7 +384,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         cur = svc.current_month(db)
         return {"results": results, "wallet_audit": problems, "server_time": now().isoformat(),
                 "wallet": wallet_view(db, u, ctx.device), "rules": svc.rules_doc(db, cur), "notices": svc.notices_doc(db),
-                "trust": svc.trust_doc(db, u, ctx.device), "cross_reports": cross}
+                "trust": svc.trust_doc(db, u, ctx.device), "cross_reports": cross, "more": more, "code_check": code_check}
 
     @app.post("/claims")
     def claims(body: ClaimsIn, ctx: Ctx = Depends(user_ctx)):
@@ -607,7 +618,8 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
             out.append({"pid": p.pid, "month": p.month, "owner": users[p.owner_id].name, "owner_phone": users[p.owner_id].phone, "owner_device": dev.label,
                         "outcome": "automatic: first report paid, later claims held, traced to owner",
                         "claimants": [{"name": users[r.to_user_id].name, "phone": users[r.to_user_id].phone, "status": r.status, "reason": r.reason,
-                                       "at": iso(r.settled_at or r.created_at), "trust": svc.trust(db, users[r.to_user_id])[0]} for r in rows]})
+                                       "at": iso(r.settled_at or r.created_at), "trust": svc.trust(db, users[r.to_user_id])[0],
+                                       "review_within_hours": svc.review_hours(svc.trust(db, users[r.to_user_id])[0]) if r.status == "held" else None} for r in rows]})
         return {"cases": out}
 
     @app.get("/admin/review")

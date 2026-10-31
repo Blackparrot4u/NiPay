@@ -55,6 +55,17 @@ cd backend && PORT=8001 uv run --with-requirements requirements.txt python -m ni
 - `src/lib/link.ts`: the wifi link. `src/lib/pipe.ts`: chunked, hashed, resumable transfer on the link. `src/lib/peercheck.ts`: the mutual check and signed cross-reports. `src/lib/protocol.ts`: wire format and the QR frames used for pairing. `src/lib/crypto.ts`: libsodium (Ed25519, X25519, ChaCha20-Poly1305).
 - IDs and signatures are made on the server only. The client never makes IDs.
 
+## Server rules added after the audit
+- A sync with no wallet snapshot is logged (`wallet_omitted`) and counts as a failed integrity check for any cross-reports in it. The bank keeps its own highest sequence per device, so a phone cannot hide a restore by lying about `seq` and `counter`.
+- Official builds: the operator registers digests (setting `official_build_digest`, comma separated). A sync with a missing or unknown `code_digest` is logged; with none registered nothing is enforced. The web demo does not send a trustworthy digest (a page can be edited), so this is for the native app.
+- Honest late claims stay valid for 6 months after the month the point was issued (phones still accept only the grace window offline).
+- First report wins on a same-ID dispute. Held claims show the claimant's trust and a review time (72 h at trust 300 down to 12 h at 850); nothing is released automatically because the first report was already paid.
+- A full receive bucket never loses a claim: the overflow is paid to the receiver's main account and the first-report order is kept.
+- `/sync` takes up to 2,500 log lines per round and answers `more: true`; the phone keeps syncing until done (a 2,000-point payment syncs fully).
+- Refill: the phone says how many points it spent offline and has not synced; the bank subtracts that (never below zero) when checking the send limit, with a hard ceiling of twice the limit, and logs the report.
+- A sync that settles at least 200 points and 5 times the user's usual rate opens a **review item only**. No daily spend limit exists (the wallet holds 2,000), and nothing is ever frozen by a review item.
+- Counter: a phone without a hardware counter gets the lower `weak_counter_send_limit` instead of a mark. The browser's counter is simulated and **weak**; the demo keeps the full limit (set `NIPAY_WEAK_COUNTER_LIMIT` to try a stricter one).
+
 ## Real versus simulated
 | Real in this repo | Not implemented in the web demo |
 |---|---|

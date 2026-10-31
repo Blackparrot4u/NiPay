@@ -92,9 +92,9 @@ def test_old_month_id_and_expired_after_grace(env):
     assert not verify_sig(env.svc.bank.public, "2025-01", pt["pid"], unb64(pt["sig"]))
     env.svc.s.grace_days = 38
     cur = pt["month"]
-    for _ in range(2):
+    for _ in range(7):
         assert env.c.post("/admin/rules/rotate", headers=admin(env)).status_code == 200
-    assert b.claim(a.pay_to(b, pt))["reason"] == "expired"   # two rotations later: outside grace
+    assert b.claim(a.pay_to(b, pt))["reason"] == "expired"   # seven months later: outside the 6-month claim buffer (phones still only accept the grace window offline)
     # old IDs do not pass the NEW month's tower/landmine rules either
     new = env.svc.bank.rules(env.svc.prev_month(env.svc.prev_month(cur)) if False else cur)
     nxt = env.svc.bank.rules("2099-01")
@@ -150,6 +150,7 @@ def test_ledger_balanced_and_failed_topup_changes_nothing(env):
 def test_insufficient_main_balance_rolls_back(env):
     a = env.phone("+919000000001", "Asha"); a.register()
     env.svc.s.send_limit = 10**9
+    env.svc.s.weak_counter_send_limit = 10**9
     r = env.c.post("/wallet/topup", json={"amount": 60000, "pin": "1234"}, headers=a.h())
     assert r.status_code == 400 and r.json()["detail"] == "insufficient"
     assert a.wallet()["main_balance"] == 50000 and a.wallet()["send_bucket"] == 0
@@ -406,7 +407,7 @@ def test_trust_certificate_is_bound_to_device_and_carries_limit_and_expiry(env):
 
 def test_cross_report_accepted_logged_and_never_suspends(env):
     a, b = pair(env)
-    out = a.sync(cross_reports=[xr(a, b, "fail", ["cert_expired", "flagged"]), xr(a, b, "pass", nonce="n2")])["cross_reports"]
+    out = a.sync(wallet={"points": []}, cross_reports=[xr(a, b, "fail", ["cert_expired", "flagged"]), xr(a, b, "pass", nonce="n2")])["cross_reports"]
     assert out["accepted"] == 2 and out["rejected"] == 0
     assert len(events(env, "cross_check_fail")) == 1
     assert b.wallet()["offline_suspended"] is False
@@ -417,15 +418,15 @@ def test_cross_report_accepted_logged_and_never_suspends(env):
     assert env.c.get("/trust/certificate", headers=b.h()).json()["score"] == 500
     # a replay of the same signed report is a duplicate, not a second log line
     rp = xr(a, b, "fail", ["x"], nonce="n3")
-    a.sync(cross_reports=[rp]); assert a.sync(cross_reports=[rp])["cross_reports"]["duplicate"] == 1
+    a.sync(wallet={"points": []}, cross_reports=[rp]); assert a.sync(wallet={"points": []}, cross_reports=[rp])["cross_reports"]["duplicate"] == 1
 
 
 def test_cross_report_rejected_when_reporter_integrity_fails_or_signature_bad(env):
     a, b = pair(env)
     # reporter says its own integrity check failed
-    assert a.sync(cross_reports=[xr(a, b, "fail", ["x"], ri="0")])["cross_reports"]["rejected"] == 1
+    assert a.sync(wallet={"points": []}, cross_reports=[xr(a, b, "fail", ["x"], ri="0")])["cross_reports"]["rejected"] == 1
     # signed by some other key, i.e. not the reporter's registered device
-    assert a.sync(cross_reports=[xr(a, b, "fail", ["x"], key=SigningKey.generate(), nonce="n9")])["cross_reports"]["rejected"] == 1
+    assert a.sync(wallet={"points": []}, cross_reports=[xr(a, b, "fail", ["x"], key=SigningKey.generate(), nonce="n9")])["cross_reports"]["rejected"] == 1
     # reporter's wallet audit fails in the same sync (foreign ID in wallet): refused too
     bad_wallet = {"points": [p["pid"] for p in a.points] + ["a" * 20], "mines": [], "seq": 0, "counter": 0, "month": a.points[0]["month"]}
     assert a.sync(wallet=bad_wallet, cross_reports=[xr(a, b, "fail", ["x"], nonce="n8")])["cross_reports"]["rejected"] == 1
@@ -461,3 +462,110 @@ def test_selfie_needs_consent_is_stored_outside_git_and_can_be_deleted(env):
     assert env.c.get("/selfie/status", headers=a.h()).json() == {"stored": True} and env.c.get("/selfie/status", headers=b.h()).json() == {"stored": False}
     assert env.c.delete("/selfie", headers=a.h()).json()["deleted"] is True
     assert env.c.get("/selfie/status", headers=a.h()).json() == {"stored": False}
+
+
+# ---- audit gaps: sync omissions, builds, 6-month claims, full bucket, batches, refill, sudden change, weak counter ----
+def received(a, b, pts):
+    return [{**a.pay_to(b, p), "role": "received"} for p in pts]
+
+
+def test_sync_without_wallet_snapshot_is_logged_and_bank_remembers_sequence(env):
+    a, b = pair(env)
+    out = a.sync()
+    assert "wallet_omitted" in out["wallet_audit"] and "wallet_omitted" in events(env)
+    snap = lambda seq: {"points": [], "mines": [], "seq": seq, "counter": seq, "month": a.points[0]["month"]}
+    assert a.sync(wallet=snap(5))["wallet_audit"] == []
+    # the phone lies that sequence and counter agree at an old value: the bank's own record catches it
+    assert "restore" in a.sync(wallet=snap(2))["wallet_audit"]
+
+
+def test_official_build_digest_missing_or_wrong_is_logged(env):
+    a, b = pair(env)
+    assert a.sync(wallet={"points": []})["code_check"] == "no_official_build_registered" and not events(env, "code_check")
+    with env.app.state.SessionLocal() as db:
+        env.svc.put_setting(db, "official_build_digest", "aaa,bbb"); db.commit()
+    assert a.sync(wallet={"points": []})["code_check"] == "missing"
+    assert env.c.post("/sync", json={"logs": [], "wallet": {"points": []}, "code_digest": "zzz"}, headers=a.h()).json()["code_check"] == "mismatch"
+    assert env.c.post("/sync", json={"logs": [], "wallet": {"points": []}, "code_digest": "bbb"}, headers=a.h()).json()["code_check"] == "match"
+    assert len(events(env, "code_check")) == 2
+
+
+def test_honest_late_claim_valid_for_six_months_then_expires(env):
+    a, b = pair(env, 20)
+    pts = a.value_points()
+    for _ in range(6):
+        with env.app.state.SessionLocal() as db:
+            env.svc.rotate(db); db.commit()
+    assert b.claim(a.pay_to(b, pts[0]))["status"] == "paid"          # six months after issue: still valid
+    with env.app.state.SessionLocal() as db:
+        env.svc.rotate(db); db.commit()
+    assert b.claim(a.pay_to(b, pts[1]))["reason"] == "expired"        # the seventh month: too late
+
+
+def test_full_receive_bucket_pays_overflow_to_main_account_and_keeps_order(env):
+    env.st.receive_limit = 1
+    a, b = pair(env, 20)
+    p = a.value_points()
+    main0 = b.wallet()["main_balance"]
+    assert b.claim(a.pay_to(b, p[0]))["status"] == "paid"
+    r = b.claim(a.pay_to(b, p[1]))
+    assert r["status"] == "paid" and b.wallet()["receive_bucket"] == 1 and b.wallet()["main_balance"] == main0 + 1
+    t = env.svc.ledger_totals(env.app.state.SessionLocal())
+    assert t["main"] + t["send"] + t["recv"] + t["pool"] + t["fees"] + t["mint"] == 0   # ledger still balances
+    c = env.phone("+919000000003", "Chand"); c.register()
+    assert c.claim(a.pay_to(c, p[1]))["status"] == "held"             # first report keeps the point
+
+
+def test_large_sync_is_batched_and_reports_more(env, monkeypatch):
+    import nipay.main as m
+    monkeypatch.setattr(m, "SYNC_BATCH", 3)
+    a, b = pair(env, 20)
+    logs = received(a, b, a.value_points()[:8])
+    out = b.sync(logs=logs, wallet={"points": []})
+    assert out["more"] is True and len(out["results"]) == 3
+    out = b.sync(logs=logs[3:], wallet={"points": []}); assert out["more"] is True
+    out = b.sync(logs=logs[6:], wallet={"points": []}); assert out["more"] is False
+    assert b.wallet()["receive_bucket"] == 8
+
+
+def test_refill_not_blocked_by_points_spent_offline_but_unsynced(env):
+    env.st.send_limit = 20
+    a, b = pair(env, 20)
+    assert env.c.post("/wallet/topup", json={"amount": 10, "pin": "1234"}, headers=a.h()).status_code == 400   # bank still counts 20 outstanding
+    r = env.c.post("/wallet/topup", json={"amount": 10, "pin": "1234", "unsynced_spent": 10}, headers=a.h())
+    assert r.status_code == 200 and len(events(env, "topup_unsynced_spend")) == 1
+    assert env.c.post("/wallet/topup", json={"amount": 20, "pin": "1234", "unsynced_spent": 999}, headers=a.h()).status_code == 400  # lying cannot exceed the hard ceiling
+
+
+def test_sudden_change_opens_review_only_and_never_freezes(env):
+    env.st.sudden_change_min = 3
+    a, b = pair(env, 20)
+    b.sync(logs=received(a, b, a.value_points()[:5]), wallet={"points": []})
+    with env.app.state.SessionLocal() as db:
+        items = db.scalars(select(ReviewItem).where(ReviewItem.type == "SUDDEN_CHANGE")).all()
+        assert len(items) == 1 and not db.scalars(select(User).where(User.phone == b.phone)).first().offline_suspended
+    assert b.wallet()["receive_bucket"] == 5 and "sudden_change" in events(env)
+
+
+def test_phone_without_hardware_counter_gets_lower_limit(env):
+    env.st.weak_counter_send_limit = 5
+    a, b = pair(env, 5)
+    assert env.c.post("/wallet/topup", json={"amount": 1, "pin": "1234"}, headers=a.h()).status_code == 400
+    assert a.wallet()["send_limit"] == 5
+    a.sync(wallet={"points": [], "counter_kind": "hardware"})
+    assert a.wallet()["send_limit"] == 2000
+    assert env.c.post("/wallet/topup", json={"amount": 1, "pin": "1234"}, headers=a.h()).status_code == 200
+
+
+def test_held_claims_show_trust_and_review_sooner_for_higher_trust(env):
+    from nipay.service import Svc
+    assert Svc.review_hours(850) < Svc.review_hours(500) < Svc.review_hours(300) == 72
+    a, b = pair(env, 20)
+    c = env.phone("+919000000003", "Chand"); c.register()
+    p = a.value_points()[0]
+    b.claim(a.pay_to(b, p)); c.claim(a.pay_to(c, p))
+    tok = TestClient(create_app(env.st, portal="admin"))
+    t = tok.post("/admin/login", json={"username": "admin", "password": env.secrets["admins"]["admin"]}).json()["token"]
+    cases = tok.get("/admin/same-id", headers={"Authorization": "Bearer " + t}).json()["cases"]
+    held = [x for x in cases[0]["claimants"] if x["status"] == "held"][0]
+    assert held["trust"] >= 300 and 12 <= held["review_within_hours"] <= 72

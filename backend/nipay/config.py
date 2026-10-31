@@ -24,6 +24,8 @@ class Settings:
     grace_days: int = 38  # design: 35-40 days after month end
     topup_fee: int = 1
     send_limit: int = 2000
+    weak_counter_send_limit: int = int(os.environ.get("NIPAY_WEAK_COUNTER_LIMIT", "2000"))  # limit for phones without a hardware counter (browser demo = weak)
+    sudden_change_min: int = 200  # a sync settling at least this many points AND 5x the usual opens a review item
     receive_limit: int = 10000
     simultaneous_alert: int = 10  # claimants on one point that raise an alert
     test_funds: int = 50000  # fake money given at sign-up

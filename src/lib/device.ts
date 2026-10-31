@@ -175,7 +175,7 @@ export const layerToTripwire = (l: string) => ({ B: 'tower', A: 'landmine', H: '
 // ---------- sync ----------
 export interface SyncResult { ok: boolean; offline?: boolean; message: string; results?: any[] }
 let syncing = false;
-export async function syncNow(): Promise<SyncResult> {
+export async function syncNow(round = 0): Promise<SyncResult> {
   const s0 = state;
   if (!s0.token || syncing) return { ok: false, message: 'not signed in' };
   syncing = true;
@@ -185,7 +185,7 @@ export async function syncNow(): Promise<SyncResult> {
       ...s0.received.filter((x) => !x.synced).map((x) => ({ role: 'received', month: x.month, pid: x.pid, sig: x.sig, handover: x.handover, payment_ref: x.ref, transport: x.transport, ts: new Date(x.ts).toISOString() })),
     ];
     const month = currentMonth();
-    const wallet = { points: s0.points.map((p) => p.pid), mines: s0.mines, seq: s0.seq, counter: hwCounter(), month, control: controlKey() || undefined };
+    const wallet = { points: s0.points.map((p) => p.pid), mines: s0.mines, seq: s0.seq, counter: hwCounter(), month, control: controlKey() || undefined, counter_kind: 'simulated-browser' };   // a browser has no hardware counter: weak, labelled so
     const sentReports = s0.crossReports;
     const r = await api('/sync', { body: { logs, reports: s0.queuedReports, cross_reports: sentReports, wallet, client_time: new Date().toISOString() }, token: s0.token });
     // adopt bank-signed documents only if the signatures are good
@@ -202,6 +202,7 @@ export async function syncNow(): Promise<SyncResult> {
     // points that settled as paid are bank-side now; remove synced received entries older than the list cap
     const hist = await api('/history', { token: s0.token }).catch(() => null);
     if (hist) set({ history: hist.payments });
+    if (r.more && round < 10) { syncing = false; return syncNow(round + 1); }   // the server takes a batch per round; send the rest
     trace(`sync ok: ${logs.length} log lines, ${results.filter((x) => x.status === 'paid').length} paid, ${results.filter((x) => x.status === 'held').length} held${rejectedDocs ? ', REJECTED unsigned rules' : ''}`);
     return { ok: true, message: 'Synced', results };
   } catch (e) {

@@ -70,7 +70,7 @@ export function TopUp() {
     setErr(null); setOk('');
     if (!checkPin(pin)) return setErr('Wrong PIN.');
     try {
-      const r = await api('/wallet/topup', { body: { amount: a, pin }, token: d.token });
+      const r = await api('/wallet/topup', { body: { amount: a, pin, unsynced_spent: get().sent.filter((x) => !x.synced).length }, token: d.token });
       addTopupPoints(r.points); set({ server: r.wallet }); await fetchRules();
       setOk(`Added ${a} points (+1 control key). Rs ${a + (get().server?.topup_fee ?? 0)} left your main account.`); 
     } catch (e) { setErr(errText(e)); }
@@ -131,7 +131,7 @@ export function More() {
         <Btn kind="danger" onClick={() => { if (confirm('Report this phone lost? Unspent points are NOT refunded (lost-phone rule).')) post('/reports', { kind: 'lost_phone', detail: 'lost phone' }, 'Reported. Old device cancelled, no refund.').then(() => set({ token: null })); }}>My phone is lost</Btn>
         {msg && <Notice tone="sky">{msg}</Notice>}
         {apps.map((a) => <div key={a.id} className="text-xs flex justify-between"><span>Appeal #{a.id}</span><Badge>{a.status}</Badge></div>)}</Card>
-      <Card className="space-y-1 text-sm"><p className="font-semibold">Device</p><p className="text-xs text-slate-500 break-all">Device public key: {d.pub.slice(0, 16)}... (the private key never leaves this phone)</p><p className="text-xs">Hardware counter (simulated): {hwCounter()} / wallet sequence {d.seq}</p><p className="text-xs">Control key: {controlKey() ? 'present, hidden' : 'none yet'}</p></Card>
+      <Card className="space-y-1 text-sm"><p className="font-semibold">Device</p><p className="text-xs text-slate-500 break-all">Device public key: {d.pub.slice(0, 16)}... (the private key never leaves this phone)</p><p className="text-xs">Counter (simulated in the browser, so weak; a real hardware counter is planned for the native app): {hwCounter()} / wallet sequence {d.seq}</p><p className="text-xs">Control key: {controlKey() ? 'present, hidden' : 'none yet'}</p></Card>
       <Card className="text-xs text-slate-600 space-y-1"><p className="font-semibold text-sm">What is real in this web demo</p>
         <p>Real: Ed25519 signatures made on this device, bank signature checks, tower, landmines, stack mines, signed rules, signed handover and received, animated-QR transfer, server settlement.</p>
         <p>Not possible in a browser, planned for the native app: Play Integrity (Android), App Attest (iPhone), root and emulator detection, a real hardware counter, self-lock, Bluetooth peripheral mode, NFC tap pairing, biometric unlock.</p>
