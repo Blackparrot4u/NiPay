@@ -59,6 +59,10 @@ class CancelIn(LoginIn):
     balance_summary: str = ""
 
 
+class RenewIn(BaseModel):
+    pids: list[str] = []
+
+
 class TopupIn(BaseModel):
     amount: int
     pin: str
@@ -80,6 +84,12 @@ class SyncIn(BaseModel):
 
 class ClaimsIn(BaseModel):
     claims: list[dict]
+    wallet: dict | None = None
+    code_digest: str = ""
+
+
+class BuildIn(BaseModel):
+    digest: str = Field(min_length=8, max_length=200)
 
 
 class ReportIn(BaseModel):
@@ -195,13 +205,12 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         cur = svc.current_month(db)
         pending = db.scalar(select(func.count()).select_from(Transfer).where(Transfer.status == "pending", (Transfer.from_user_id == u.id) | (Transfer.to_user_id == u.id)))
         rot = svc.rotated_at(db)
-        nxt = (rot.replace(day=28) + timedelta(days=5)).replace(day=1)
         return {"id": u.id, "name": u.name, "phone": u.phone, "bank": u.bank, "region": u.region, "language": u.language,
                 "kyc_status": u.kyc_status, "kyc_note": "test data only; no real Aadhaar/PAN is stored",
                 "main_balance": u.main_balance, "send_bucket": u.send_bucket, "receive_bucket": u.receive_bucket,
                 "send_limit": svc.send_limit_for(db, dev), "receive_limit": st.receive_limit, "topup_fee": st.topup_fee, "offline_suspended": u.offline_suspended,
-                "suspend_reason": u.suspend_reason, "month": cur, "days_until_renewal": max(0, (nxt - datetime.now(timezone.utc)).days),
-                "grace_days": st.grace_days, "pending_transfers": pending,
+                "suspend_reason": u.suspend_reason, "month": cur, "days_until_renewal": svc.days_until_renewal(db),
+                "renews_on": svc.renews_at(db).isoformat(), "grace_ends": (rot + timedelta(days=st.grace_days)).isoformat(), "grace_days": st.grace_days, "pending_transfers": pending,
                 "last_sync_at": u.last_sync_at.isoformat() if u.last_sync_at else None,
                 "device": {"id": dev.id, "label": dev.label} if dev else None}
 
@@ -339,6 +348,12 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         ctx.db.commit()
         return {"points": pts, "fee": st.topup_fee, "wallet": wallet_view(ctx.db, ctx.user, ctx.device)}
 
+    @app.post("/wallet/renew")
+    def renew(body: RenewIn, ctx: Ctx = Depends(user_ctx)):
+        pts = svc.renew(ctx.db, ctx.user, ctx.device, body.pids)
+        ctx.db.commit()
+        return {"points": pts, "wallet": wallet_view(ctx.db, ctx.user, ctx.device)}
+
     @app.post("/wallet/move-to-main")
     def move_to_main(body: MoveIn, ctx: Ctx = Depends(user_ctx)):
         try:
@@ -360,42 +375,55 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
                 out.append({"pid": e.get("pid", ""), "status": "rejected", "reason": r.code})
         return out
 
+    def checks_after_logs(ctx: Ctx, results: list, wallet: dict | None, code_digest: str, sent_before: int) -> tuple:
+        """What every route that takes logs runs afterwards, so no route is a way around it: sudden-change review, wallet audit, build check."""
+        db, u = ctx.db, ctx.user
+        new_sent = (db.scalar(select(func.count()).select_from(Transfer).where(Transfer.from_user_id == u.id, Transfer.source == "sender")) or 0) - sent_before
+        svc.sudden_change(db, u, sum(1 for r in results if r.get("status") == "paid"))
+        if wallet:
+            svc.note_counter(db, ctx.device, wallet)
+            problems = svc.audit_wallet(db, u, ctx.device, wallet, new_sent)
+        else:  # leaving the snapshot out must not skip the audit silently
+            problems = ["wallet_omitted"]
+            svc.event(db, "wallet_omitted", "MEDIUM", u.id, "", "request arrived without a wallet snapshot, so no restore or mine audit was possible", source="phone")
+        return problems, svc.check_build(db, u, code_digest)
+
+    def sent_count(ctx: Ctx) -> int:
+        return ctx.db.scalar(select(func.count()).select_from(Transfer).where(Transfer.from_user_id == ctx.user.id, Transfer.source == "sender")) or 0
+
     @app.post("/sync")
     def sync(body: SyncIn, ctx: Ctx = Depends(user_ctx)):
         db, u = ctx.db, ctx.user
+        before = sent_count(ctx)
         results = run_logs(ctx, body.logs)
         more = len(body.logs) > SYNC_BATCH   # the phone sends the rest in its next round
-        svc.sudden_change(db, u, sum(1 for r in results if r.get("status") == "paid"))
         for r in body.reports[:50]:
             t = str(r.get("type", ""))
             if t in TRIPWIRES:
                 svc.event(db, t, "MEDIUM", u.id, str(r.get("pid", ""))[:20], str(r.get("description", ""))[:300], source="phone")
-        if body.wallet:
-            svc.note_counter(db, ctx.device, body.wallet)
-            problems = svc.audit_wallet(db, u, ctx.device, body.wallet)
-        else:  # leaving the snapshot out must not skip the audit silently
-            problems = ["wallet_omitted"]
-            svc.event(db, "wallet_omitted", "MEDIUM", u.id, "", "sync arrived without a wallet snapshot, so no restore or mine audit was possible", source="phone")
-        code_check = svc.check_build(db, u, body.code_digest)
+        problems, code_check = checks_after_logs(ctx, results, body.wallet, body.code_digest, before)
         cross = svc.ingest_cross_reports(db, u, ctx.device, body.cross_reports, problems)
         u.last_sync_at = now()
         db.add(Report(user_id=u.id, kind="sync", detail=json.dumps({"logs": len(body.logs), "reports": len(body.reports), "problems": problems})))
         db.commit()
         cur = svc.current_month(db)
         return {"results": results, "wallet_audit": problems, "server_time": now().isoformat(),
-                "wallet": wallet_view(db, u, ctx.device), "rules": svc.rules_doc(db, cur), "notices": svc.notices_doc(db),
+                "wallet": wallet_view(db, u, ctx.device), "rules": svc.rules_doc(db, cur),
+                "previous_rules": svc.rules_doc(db, svc.prev_month(cur)) if svc.month_valid(db, svc.prev_month(cur)) else None, "notices": svc.notices_doc(db),
                 "trust": svc.trust_doc(db, u, ctx.device), "cross_reports": cross, "more": more, "code_check": code_check}
 
     @app.post("/claims")
     def claims(body: ClaimsIn, ctx: Ctx = Depends(user_ctx)):
+        before = sent_count(ctx)
         res = []
         for e in body.claims[:2500]:
             try:
                 res.append(svc.process_transfer(ctx.db, ctx.user, "claimant", e))
             except Rejected as r:
                 res.append({"pid": e.get("pid", ""), "status": "rejected", "reason": r.code})
+        problems, code_check = checks_after_logs(ctx, res, body.wallet, body.code_digest, before)
         ctx.db.commit()
-        return {"results": res, "wallet": wallet_view(ctx.db, ctx.user, ctx.device)}
+        return {"results": res, "wallet": wallet_view(ctx.db, ctx.user, ctx.device), "wallet_audit": problems, "code_check": code_check}
 
     @app.get("/history")
     def history(ctx: Ctx = Depends(user_ctx)):
@@ -441,15 +469,8 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         cur = svc.current_month(ctx.db)
         out = {"play_integrity": "not_implemented_in_web_demo", "app_attest": "not_implemented_in_web_demo",
                "month": cur, "block": list(choose_block(svc.bank.seed, cur, 100000))}
-        official = ctx.db.get(Setting, "official_build_digest")
-        if body.code_digest and official is None:
-            out["code_check"] = "no_official_build_registered"
-        elif body.code_digest:
-            ok = body.code_digest == official.value
-            out["code_check"] = "match" if ok else "mismatch"
-            if not ok:
-                svc.event(ctx.db, "code_check", "HIGH", ctx.user.id, "", "code block digest does not match the official build")
-                ctx.db.commit()
+        out["code_check"] = svc.check_build(ctx.db, ctx.user, body.code_digest)   # same check as /sync: split list, missing digest logged
+        ctx.db.commit()
         return out
 
     # ---------- selfie (team demo only) ----------
@@ -679,6 +700,36 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
                 "bad_id_notices": db.scalar(select(func.count()).select_from(Notice)), "bank_public_key": svc.pub_b64,
                 "points_issued_this_month": db.scalar(select(func.count()).select_from(Point).where(Point.month == cur)),
                 "secrets": "seed and signing key are held on the server only and are not displayed"}
+
+    @app.get("/admin/builds")
+    def a_builds(ctx: Ctx = Depends(admin_ctx)):
+        return {"digests": svc.official_digests(ctx.db), "note": "Digests of official builds. A sync, claim or integrity check with a missing or unknown digest is logged."}
+
+    @app.post("/admin/builds")
+    def a_build_add(body: BuildIn, request: Request, ctx: Ctx = Depends(admin_ctx)):
+        if ctx.session.admin_role != "SUPER_ADMIN":
+            bad("super_admin_only", 403)
+        d = body.digest.strip()
+        if "," in d or " " in d:
+            bad("bad_digest")
+        cur = [x for x in (svc.get_setting(ctx.db, "official_build_digest", "") or "").split(",") if x]
+        if d not in cur:
+            cur.append(d)
+        svc.put_setting(ctx.db, "official_build_digest", ",".join(cur))
+        svc.audit(ctx.db, ctx.session.admin_name, ctx.session.admin_role, "REGISTER_BUILD", d[:40], ip_of(request))
+        ctx.db.commit()
+        return {"digests": svc.official_digests(ctx.db)}
+
+    @app.post("/admin/builds/remove")
+    def a_build_remove(body: BuildIn, request: Request, ctx: Ctx = Depends(admin_ctx)):
+        if ctx.session.admin_role != "SUPER_ADMIN":
+            bad("super_admin_only", 403)
+        d = body.digest.strip()
+        cur = [x for x in (svc.get_setting(ctx.db, "official_build_digest", "") or "").split(",") if x and x != d]
+        svc.put_setting(ctx.db, "official_build_digest", ",".join(cur))
+        svc.audit(ctx.db, ctx.session.admin_name, ctx.session.admin_role, "REMOVE_BUILD", d[:40], ip_of(request))
+        ctx.db.commit()
+        return {"digests": svc.official_digests(ctx.db)}
 
     @app.post("/admin/rules/rotate")
     def a_rotate(request: Request, ctx: Ctx = Depends(admin_ctx)):

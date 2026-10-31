@@ -64,20 +64,42 @@ class Svc:
         cy, cm = int(cur[:4]), int(cur[5:])
         return (cy * 12 + cm) - (y * 12 + m) <= self.CLAIM_MONTHS
 
+    def calendar_month(self) -> str:
+        return datetime.now(self.s.tz).strftime("%Y-%m")
+
     def current_month(self, db) -> str:
+        """The calendar month in the configured zone, rolling over by itself. An admin rotation (demo) can only move it AHEAD of the calendar."""
         row = db.get(Setting, "month_override")
-        return row.value if row else datetime.now(timezone.utc).strftime("%Y-%m")
+        cal = self.calendar_month()
+        return max(cal, row.value) if row else cal
 
     @staticmethod
     def prev_month(m: str) -> str:
         y, mo = int(m[:4]), int(m[5:])
         return f"{y - 1}-12" if mo == 1 else f"{y}-{mo - 1:02d}"
 
+    @staticmethod
+    def next_month(m: str) -> str:
+        y, mo = int(m[:4]), int(m[5:])
+        return f"{y + 1}-01" if mo == 12 else f"{y}-{mo + 1:02d}"
+
+    def month_start(self, month: str) -> datetime:
+        """00:00 of the first day of `month` in the configured zone, as UTC."""
+        return datetime(int(month[:4]), int(month[5:]), 1, tzinfo=self.s.tz).astimezone(timezone.utc)
+
     def rotated_at(self, db) -> datetime:
-        row = db.get(Setting, "rotated_at")
-        if row:
+        """When the current month's rules started: the admin's rotation time if that is what made this month current, else the calendar month start."""
+        cur, ov, row = self.current_month(db), db.get(Setting, "month_override"), db.get(Setting, "rotated_at")
+        if ov and ov.value == cur and row:
             return datetime.fromisoformat(row.value)
-        return datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return self.month_start(cur)
+
+    def renews_at(self, db) -> datetime:
+        return self.month_start(self.next_month(self.current_month(db)))
+
+    def days_until_renewal(self, db) -> int:
+        tz = self.s.tz
+        return max(0, (self.renews_at(db).astimezone(tz).date() - datetime.now(tz).date()).days)
 
     def month_valid(self, db, month: str) -> bool:
         """Current month, or last month while inside the grace period after the monthly rotation."""
@@ -89,9 +111,7 @@ class Svc:
         return False
 
     def rotate(self, db) -> str:
-        nxt = self.current_month(db)
-        y, mo = int(nxt[:4]), int(nxt[5:])
-        nxt = f"{y + 1}-01" if mo == 12 else f"{y}-{mo + 1:02d}"
+        nxt = self.next_month(self.current_month(db))
         for k, v in (("month_override", nxt), ("rotated_at", now().isoformat())):
             row = db.get(Setting, k)
             if row:
@@ -174,13 +194,11 @@ class Svc:
         if amount <= 0:
             raise Rejected("bad_amount")
         limit = self.send_limit_for(db, device)
-        # Points the phone already spent offline stay in send_bucket until their logs reach the bank, so counting them would stall a refill.
-        # The phone says how many it has spent but not yet synced; that only counts up to what the bank can see is outstanding, and the
-        # hard ceiling (twice the limit) bounds the bank's exposure if a phone lies. A false report is logged.
-        spent = max(0, min(int(unsynced_spent or 0), user.send_bucket))
-        if spent:
-            self.event(db, "topup_unsynced_spend", "LOW", user.id, "", f"refill with {spent} points spent offline and not yet synced")
-        if user.send_bucket - spent + amount > limit or user.send_bucket + amount > 2 * limit:
+        # The send bucket is what the BANK has settled, never what the phone says. Points spent offline stay in the bucket until their logs reach
+        # the bank, so a phone with unsynced spends must sync first. A client-claimed "spent" number is not trusted: KT's cap is 2,000.
+        if int(unsynced_spent or 0) > 0:
+            raise Rejected("sync_first")
+        if user.send_bucket + amount > limit:
             raise Rejected("send_limit")
         if user.offline_suspended:
             raise Rejected("offline_suspended")
@@ -199,6 +217,33 @@ class Svc:
             sig = b64(self.bank.signing.sign(f"{month}|{pid}".encode()).signature)
             db.add(Point(month=month, pid=pid, sig=sig, kind=kind, owner_id=user.id, device_id=device.id))
             out.append({"pid": pid, "month": month, "sig": sig, "kind": kind})
+        return out
+
+    def renew(self, db, user: User, device: Device, pids: list) -> list:
+        """Monthly ID renewal: the phone hands in unspent IDs of an older month that is still in grace and gets the same number of IDs of the
+        current month. No money moves and the send bucket does not change. The old IDs stay claimable (an honest receiver must still be paid);
+        a phone that kept and spent them as well only drains its own send bucket, so later claims on it fail as 'owner_bucket_empty'."""
+        cur = self.current_month(db)
+        old = [p for p in db.scalars(select(Point).where(Point.owner_id == user.id, Point.device_id == device.id, Point.kind == "value",
+                                                         Point.status == "issued", Point.pid.in_([str(x) for x in pids[:2000]]))) if p.month != cur and self.month_valid(db, p.month)]
+        if not old or user.offline_suspended:
+            return []
+        rules, out = self.bank.rules(cur), []
+        for o in old:
+            o.status = "renewed"   # still claimable (an honest receiver is paid), but never renewed twice
+            pid = make_id(rules)
+            while db.scalar(select(Point.id).where(Point.month == cur, Point.pid == pid)):
+                pid = make_id(rules)
+            sig = b64(self.bank.signing.sign(f"{cur}|{pid}".encode()).signature)
+            db.add(Point(month=cur, pid=pid, sig=sig, kind="value", owner_id=user.id, device_id=device.id))
+            out.append({"pid": pid, "month": cur, "sig": sig, "kind": "value"})
+        has_control = db.scalar(select(func.count()).select_from(Point).where(
+            Point.owner_id == user.id, Point.device_id == device.id, Point.kind == "control", Point.month == cur))
+        if not has_control:
+            pid = make_id(rules)
+            sig = b64(self.bank.signing.sign(f"{cur}|{pid}".encode()).signature)
+            db.add(Point(month=cur, pid=pid, sig=sig, kind="control", owner_id=user.id, device_id=device.id))
+            out.append({"pid": pid, "month": cur, "sig": sig, "kind": "control"})
         return out
 
     def move_to_main(self, db, user: User, amount: int):
@@ -335,21 +380,29 @@ class Svc:
         kind = str(snap.get("counter_kind", "none"))
         self.put_setting(db, f"counter:{device.id}", kind if kind in ("hardware", "simulated-browser") else "none")
 
-    def check_seq(self, db, user: User, device: Device, seq) -> list:
-        """The sequence number is phone-supplied, so the bank keeps its own highest value per device: going backwards means a restored copy."""
-        if not isinstance(seq, int):
+    def check_seq(self, db, user: User, device: Device, seq, new_sent: int = 0) -> list:
+        """The sequence number is phone-supplied, so the bank keeps its own highest value per device. Going backwards means a restored copy; so does
+        standing still while this very sync carries payments the bank had not seen (every payment bumps the sequence)."""
+        if not isinstance(seq, int) or isinstance(seq, bool):
             return []
         key = f"seq:{device.id}"
         last = int(self.get_setting(db, key, "-1"))
         if seq < last:
             self.event(db, "restore", "HIGH", user.id, "", f"wallet sequence {seq} is behind the bank's own record {last} for this device")
             return ["restore"]
+        if seq == last and new_sent > 0:
+            self.event(db, "restore", "HIGH", user.id, "", f"wallet sequence {seq} did not move although {new_sent} new payments arrived: a restored copy repeats its number")
+            return ["restore"]
         self.put_setting(db, key, str(seq))
         return []
 
+    def official_digests(self, db) -> list:
+        raw = (self.get_setting(db, "official_build_digest", "") or "").split(",") + list(self.s.official_builds)
+        return sorted({d.strip() for d in raw if d.strip()})
+
     def check_build(self, db, user: User, digest: str) -> str:
         """Per official build: the operator registers the digests of official builds. Missing or unknown digests are logged, never silently skipped."""
-        official = [d for d in (self.get_setting(db, "official_build_digest", "") or "").split(",") if d]
+        official = self.official_digests(db)
         if not official:
             return "no_official_build_registered"
         if not digest:
@@ -360,19 +413,41 @@ class Svc:
             return "mismatch"
         return "match"
 
-    def audit_wallet(self, db, user: User, device: Device, snap: dict) -> list:
+    WALLET_FIELDS = ("points", "seq", "counter", "month", "mines")
+
+    def audit_wallet(self, db, user: User, device: Device, snap: dict, new_sent: int = 0) -> list:
         out = []
         month = self.current_month(db)
-        pids = [str(p) for p in snap.get("points", [])]
+        # a snapshot with fields left out is a signal, not a free pass
+        missing = [f for f in self.WALLET_FIELDS if f not in snap or snap[f] is None]
+        if not isinstance(snap.get("points", []), list):
+            missing.append("points_not_a_list")
+            snap = {**snap, "points": []}
+        if missing:
+            out.append("wallet_incomplete")
+            self.event(db, "wallet_incomplete", "MEDIUM", user.id, "", f"wallet snapshot left out or broke: {', '.join(missing)}", source="phone")
+        pids = [str(p) for p in snap.get("points") or []]
+        if len(set(pids)) != len(pids):
+            out.append("duplicate_ids")
+            self.event(db, "wallet_incomplete", "MEDIUM", user.id, "", "wallet snapshot lists the same ID twice", source="phone")
+        # the bank's own count: value IDs it issued to this device that are still unspent and still valid, minus those it already knows are on their way out
+        held_by_bank = db.scalar(select(func.count()).select_from(Point).where(
+            Point.device_id == device.id, Point.kind == "value", Point.status == "issued", Point.month.in_([month, self.prev_month(month)]))) or 0
+        leaving = db.scalar(select(func.count()).select_from(Transfer).join(Point, Transfer.point_id == Point.id).where(
+            Transfer.from_user_id == user.id, Transfer.status == "pending", Point.status == "issued", Point.device_id == device.id)) or 0
+        expect = max(0, held_by_bank - leaving)
+        if len(set(pids)) < expect:
+            out.append("wallet_count_low")
+            self.event(db, "wallet_count_low", "MEDIUM", user.id, "", f"wallet lists {len(set(pids))} IDs but the bank counts {expect} unspent IDs issued to this device", source="phone")
         mine_pids = set(pids)
-        mine = [tuple(m) for m in snap.get("mines", [])]
+        mine = [tuple(m) for m in snap.get("mines") or []]
         if pids:
             known = {p.pid for p in db.scalars(select(Point).where(Point.device_id == device.id, Point.pid.in_(pids)))}
             foreign = [p for p in pids if p not in known]
             if foreign:
                 out.append("forged")
                 self.event(db, "forged", "CRITICAL", user.id, foreign[0], f"{len(foreign)} IDs in the wallet were never issued to this device")
-        out += self.check_seq(db, user, device, snap.get("seq"))
+        out += self.check_seq(db, user, device, snap.get("seq"), new_sent)
         if snap.get("seq") is not None and snap.get("counter") is not None and snap["seq"] != snap["counter"]:
             out.append("restore")
             self.event(db, "restore", "HIGH", user.id, "", "wallet sequence behind the hardware counter: wallet was restored from a copy")
@@ -416,7 +491,7 @@ class Svc:
         paid = db.scalar(select(func.count()).select_from(Transfer).where(
             Transfer.status == "paid", Transfer.settled_at >= since, (Transfer.from_user_id == user.id) | (Transfer.to_user_id == user.id)))
         bad = db.scalar(select(func.count()).select_from(SecurityEvent).where(
-            SecurityEvent.user_id == user.id, SecurityEvent.created_at >= since, SecurityEvent.type.notin_(("lost_phone_claim", "cross_check_fail", "cross_report_rejected", "sudden_change", "wallet_omitted", "topup_unsynced_spend", "code_check"))))
+            SecurityEvent.user_id == user.id, SecurityEvent.created_at >= since, SecurityEvent.type.notin_(("lost_phone_claim", "cross_check_fail", "cross_report_rejected", "sudden_change", "wallet_omitted", "wallet_incomplete", "wallet_count_low", "topup_unsynced_spend", "code_check"))))
         held = db.scalar(select(func.count()).select_from(Transfer).where(
             Transfer.status == "held", Transfer.from_user_id == user.id, Transfer.settled_at >= since))
         score = 500 + min(120, age * 120 // 180) + min(100, paid * 5) - min(300, bad * 60) - min(200, held * 200)
