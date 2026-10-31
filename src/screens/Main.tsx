@@ -49,7 +49,8 @@ export function Home() {
       <Card className="text-xs text-slate-600 space-y-1">
         <div className="flex justify-between"><span>Last synced</span><b>{d.lastSync ? new Date(d.lastSync).toLocaleString() : 'never'}</b></div>
         <div className="flex justify-between"><span>Waiting to sync</span><b data-testid="unsynced">{unsynced} log lines</b></div>
-        <div className="flex justify-between"><span>Rules month / days until renewal</span><b>{currentMonth() || '-'} / {s?.days_until_renewal ?? '-'}</b></div>
+        <div className="flex justify-between"><span>IDs renew in</span><b data-testid="renew">{s?.days_until_renewal != null ? `${s.days_until_renewal} days` : '-'}</b></div>
+        <div className="flex justify-between"><span>Rules month</span><b>{currentMonth() || '-'}</b></div>
         <div className="flex justify-between"><span>Trust score (bank-signed)</span><b>{d.trust?.score ?? '-'}</b></div>
       </Card>
       <Btn kind="ghost" disabled={!online} data-testid="sync-btn" onClick={async () => { const r = await syncNow(); await refreshWallet(); setMsg(r.message); }}>Sync now (needs internet)</Btn>
@@ -135,7 +136,7 @@ export function More() {
         <p>Not possible in a browser, planned for the native app: Play Integrity (Android), App Attest (iPhone), root and emulator detection, a real hardware counter, self-lock, Bluetooth peripheral mode, NFC tap pairing, biometric unlock.</p>
         <p>Test data only: no real Aadhaar, PAN or bank data is stored. Fake money.</p></Card>
       <WifiShare />
-      <div className="grid grid-cols-2 gap-2"><Btn kind="ghost" onClick={() => go('/checks')} data-testid="to-checks">Security checks</Btn><Btn kind="ghost" onClick={() => go('/inspect')}>Mine inspector</Btn></div>
+      <Btn kind="ghost" onClick={() => go('/inspect')}>Mine inspector</Btn>
       {d.locked && <Card className="text-xs space-y-1"><p>This wallet looks restored from a copy, so it is locked (self-lock). On a real phone you would upload documents to support. Demo shortcut:</p><Btn kind="ghost" onClick={() => set({ locked: false, seq: hwCounter() })}>Support approved: unlock (demo)</Btn></Card>}
       <Btn kind="ghost" onClick={async () => { await logout(); go('/welcome'); }}>Sign out</Btn>
       <Btn kind="ghost" onClick={() => { if (confirm('Erase this phone\'s keys and points? (Test only)')) { resetDevice(); go('/welcome'); } }}>Erase this demo phone</Btn>
