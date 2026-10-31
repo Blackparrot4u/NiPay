@@ -1,0 +1,7 @@
+{
+  "name": "Offline Payments Prototype - Test Sandbox",
+  "description": "Idea-stage prototype for offline peer-to-peer point-based payment authorization with bank-signed 20-character IDs and auto-sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
