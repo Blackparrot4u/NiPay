@@ -133,12 +133,11 @@ export function More() {
         {apps.map((a) => <div key={a.id} className="text-xs flex justify-between"><span>Appeal #{a.id}</span><Badge>{a.status}</Badge></div>)}</Card>
       <Card className="space-y-1 text-sm"><p className="font-semibold">Device</p><p className="text-xs text-slate-500 break-all">Device public key: {d.pub.slice(0, 16)}... (the private key never leaves this phone)</p><p className="text-xs">Counter (simulated in the browser, so weak; a real hardware counter is planned for the native app): {hwCounter()} / wallet sequence {d.seq}</p><p className="text-xs">Control key: {controlKey() ? 'present, hidden' : 'none yet'}</p></Card>
       <Card className="text-xs text-slate-600 space-y-1"><p className="font-semibold text-sm">What is real in this web demo</p>
-        <p>Real: Ed25519 signatures made on this device, bank signature checks, tower, landmines, stack mines, signed rules, signed handover and received, animated-QR transfer, server settlement.</p>
+        <p>Real: Ed25519 signatures made on this device, bank signature checks, signed rules, signed handover and received, animated-QR transfer, server settlement.</p>
         <p>Not possible in a browser, planned for the native app: Play Integrity (Android), App Attest (iPhone), root and emulator detection, a real hardware counter, self-lock, Bluetooth peripheral mode, NFC tap pairing, biometric unlock.</p>
         <p>Test data only: no real Aadhaar, PAN or bank data is stored. Fake money.</p></Card>
       <WifiShare />
       <Security />
-      <Btn kind="ghost" onClick={() => go('/inspect')}>Mine inspector</Btn>
       {d.locked && <Card className="text-xs space-y-1"><p>This wallet looks restored from a copy, so it is locked (self-lock). On a real phone you would upload documents to support. Demo shortcut:</p><Btn kind="ghost" onClick={() => set({ locked: false, seq: hwCounter() })}>Support approved: unlock (demo)</Btn></Card>}
       <Btn kind="ghost" onClick={async () => { await logout(); go('/welcome'); }}>Sign out</Btn>
       <Btn kind="ghost" onClick={() => { if (confirm('Erase this phone\'s keys and points? (Test only)')) { resetDevice(); go('/welcome'); } }}>Erase this demo phone</Btn>

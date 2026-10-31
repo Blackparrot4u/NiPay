@@ -4,7 +4,7 @@ import { Welcome, Signup, Login } from './screens/Auth';
 import { Home, TopUp, Move, History, More, useOnline } from './screens/Main';
 import { Pay } from './screens/Pay';
 import { Receive } from './screens/Receive';
-import { Inspect } from './screens/Inspect';
+import { NiPayHeader, UserSidebar, BottomNav } from './layout/UserShell';
 import { Selfie } from './screens/Selfie';
 import { Badge } from './ui';
 
@@ -31,23 +31,21 @@ export default function App() {
     case '/move': view = <Move />; break;
     case '/more': view = <More />; break;
     case '/selfie': view = <Selfie />; break;
-    case '/inspect': view = <Inspect />; break;
+    case '/report': view = <More />; break;
     default: view = <Home />;
   }
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <div className="mx-auto max-w-md px-4 pb-24 pt-4">
-        {slotName !== 'main' && <div className="mb-2"><Badge tone="blue">test slot: {slotName}</Badge></div>}
-        {view}
-        <p className="mt-8 text-center text-[11px] text-slate-400">Prototype · fake money · test data only · web demo (see More for what is real)</p>
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
+      {signedIn && <NiPayHeader />}
+      <div className="flex flex-1">
+        {signedIn && <UserSidebar route={route} />}
+        <main className={`flex-1 mx-auto w-full px-4 pt-4 pb-24 md:pb-8 ${signedIn ? 'max-w-3xl' : 'max-w-md'}`}>
+          {!signedIn && slotName !== 'main' && <div className="mb-2"><Badge tone="blue">test slot: {slotName}</Badge></div>}
+          {view}
+          <p className="mt-8 text-center text-[11px] text-slate-400">Prototype · fake money · test data only · web demo (see More for what is real)</p>
+        </main>
       </div>
-      {signedIn && (
-        <nav className="fixed bottom-0 inset-x-0 border-t bg-white">
-          <div className="mx-auto max-w-md grid grid-cols-5 text-center text-xs">
-            {[['/', 'Home'], ['/pay', 'Pay'], ['/receive', 'Receive'], ['/history', 'History'], ['/more', 'More']].map(([p, l]) => <a key={p} href={`#${p}`} className={`py-3 ${route === p ? 'font-bold text-slate-900' : 'text-slate-500'}`}>{l}</a>)}
-          </div>
-        </nav>
-      )}
+      {signedIn && <BottomNav route={route} />}
     </div>
   );
 }

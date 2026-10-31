@@ -13,7 +13,6 @@ export const NAV: { label: string; route: string; icon: React.ElementType; badge
   { label: 'Receive', route: '/receive', icon: ArrowDownLeft },
   { label: 'Add points', route: '/topup', icon: PlusCircle },
   { label: 'Move money to bank', route: '/move', icon: ArrowRightLeft },
-  { label: 'ID store and mines', route: '/inspect', icon: Layers },
   { label: 'History', route: '/history', icon: History },
   { label: 'Report or appeal', route: '/report', icon: LifeBuoy },
   { label: 'Settings', route: '/more', icon: Settings, routes: ['/settings', '/selfie'] },
@@ -88,7 +87,7 @@ export function UserSidebar({ route }: { route: string }) {
   );
 }
 
-const TABS = [NAV[0], NAV[1], NAV[2], NAV[6], NAV[8]];
+const TABS = [NAV[0], NAV[1], NAV[2], NAV[5], NAV[7]];
 export function BottomNav({ route }: { route: string }) {
   return (
     <nav className="md:hidden fixed bottom-0 inset-x-0 z-40 border-t border-slate-200 bg-white/95 backdrop-blur pb-[env(safe-area-inset-bottom)]" aria-label="Main">
