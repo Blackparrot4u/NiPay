@@ -64,6 +64,17 @@ class Phone:
         assert r.status_code == 200, r.text
         return r.json()
 
+    def snap(self, seq_=0, **over):
+        """An honest, complete wallet snapshot: every field present, every unspent ID listed."""
+        from nipay.core.wallet import find_mines, mine_recipe
+        d = {"points": [p["pid"] for p in self.points], "seq": seq_, "counter": seq_, "month": self.points[0]["month"] if self.points else ""}
+        d.update(over)
+        if "mines" not in over:   # armed like the phone does: a third of the value IDs, three per mine
+            ctrl = {p["pid"] for p in self.points if p["kind"] == "control"}
+            ids = [x for x in d["points"] if x not in ctrl]
+            d["mines"] = find_mines(mine_recipe(self.bank_seed, d["month"]), ids, len(ids) // 3) if len(ids) >= 9 and d["month"] else []
+        return d
+
     def wallet(self):
         return self.c.get("/wallet", headers=self.h()).json()
 
@@ -73,6 +84,7 @@ def env():
     d = tempfile.mkdtemp()
     st = Settings(data_dir=Path(d), rate_limit_per_min=100000, login_rate_per_min=100000)
     app = create_app(st)
+    Phone.bank_seed = app.state.svc.bank.seed
     with TestClient(app) as c:
         yield type("Env", (), {"app": app, "c": c, "svc": app.state.svc, "st": st, "dir": d,
                                "secrets": load_secrets(Path(d)), "phone": lambda self, n, name="P", **k: Phone(c, n, name, **k)})()

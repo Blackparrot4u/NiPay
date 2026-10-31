@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import secrets
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,7 +22,9 @@ class Settings:
     database_url: str = ""
     rate_limit_per_min: int = int(os.environ.get("NIPAY_RATE_LIMIT", "600"))
     login_rate_per_min: int = int(os.environ.get("NIPAY_LOGIN_RATE", "20"))
+    tz_name: str = os.environ.get("NIPAY_TZ", "")  # calendar for the monthly rules; empty = this machine's local zone (never UTC by accident)
     grace_days: int = 38  # design: 35-40 days after month end
+    official_builds: tuple = tuple(x for x in os.environ.get("NIPAY_OFFICIAL_BUILDS", "").split(",") if x.strip())  # digests of official builds (also settable by a super admin)
     topup_fee: int = 1
     send_limit: int = 2000
     weak_counter_send_limit: int = int(os.environ.get("NIPAY_WEAK_COUNTER_LIMIT", "2000"))  # limit for phones without a hardware counter (browser demo = weak)
@@ -33,6 +36,14 @@ class Settings:
     # each website has its own origin and its own list: the user site never allows the admin origin, and the reverse
     cors_origins: tuple = ("http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "http://127.0.0.1:8000")
     admin_cors_origins: tuple = ("http://localhost:3001", "http://127.0.0.1:3001", "http://localhost:8001", "http://127.0.0.1:8001")
+
+    @property
+    def tz(self):
+        """The zone whose calendar decides the rules month. A month must not roll over at 05:30 local because UTC says so."""
+        if self.tz_name:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(self.tz_name)
+        return datetime.now().astimezone().tzinfo
 
     def __post_init__(self):
         self.data_dir = Path(self.data_dir)

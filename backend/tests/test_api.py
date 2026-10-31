@@ -407,7 +407,7 @@ def test_trust_certificate_is_bound_to_device_and_carries_limit_and_expiry(env):
 
 def test_cross_report_accepted_logged_and_never_suspends(env):
     a, b = pair(env)
-    out = a.sync(wallet={"points": []}, cross_reports=[xr(a, b, "fail", ["cert_expired", "flagged"]), xr(a, b, "pass", nonce="n2")])["cross_reports"]
+    out = a.sync(wallet=a.snap(), cross_reports=[xr(a, b, "fail", ["cert_expired", "flagged"]), xr(a, b, "pass", nonce="n2")])["cross_reports"]
     assert out["accepted"] == 2 and out["rejected"] == 0
     assert len(events(env, "cross_check_fail")) == 1
     assert b.wallet()["offline_suspended"] is False
@@ -418,7 +418,7 @@ def test_cross_report_accepted_logged_and_never_suspends(env):
     assert env.c.get("/trust/certificate", headers=b.h()).json()["score"] == 500
     # a replay of the same signed report is a duplicate, not a second log line
     rp = xr(a, b, "fail", ["x"], nonce="n3")
-    a.sync(wallet={"points": []}, cross_reports=[rp]); assert a.sync(wallet={"points": []}, cross_reports=[rp])["cross_reports"]["duplicate"] == 1
+    a.sync(wallet=a.snap(), cross_reports=[rp]); assert a.sync(wallet=a.snap(), cross_reports=[rp])["cross_reports"]["duplicate"] == 1
 
 
 def test_cross_report_rejected_when_reporter_integrity_fails_or_signature_bad(env):
@@ -469,11 +469,15 @@ def received(a, b, pts):
     return [{**a.pay_to(b, p), "role": "received"} for p in pts]
 
 
+def sent(a, b, pts):
+    return [{**a.pay_to(b, p), "role": "sent"} for p in pts]
+
+
 def test_sync_without_wallet_snapshot_is_logged_and_bank_remembers_sequence(env):
     a, b = pair(env)
     out = a.sync()
     assert "wallet_omitted" in out["wallet_audit"] and "wallet_omitted" in events(env)
-    snap = lambda seq: {"points": [], "mines": [], "seq": seq, "counter": seq, "month": a.points[0]["month"]}
+    snap = lambda seq: a.snap(seq)
     assert a.sync(wallet=snap(5))["wallet_audit"] == []
     # the phone lies that sequence and counter agree at an old value: the bank's own record catches it
     assert "restore" in a.sync(wallet=snap(2))["wallet_audit"]
@@ -528,13 +532,23 @@ def test_large_sync_is_batched_and_reports_more(env, monkeypatch):
     assert b.wallet()["receive_bucket"] == 8
 
 
-def test_refill_not_blocked_by_points_spent_offline_but_unsynced(env):
+def test_refill_needs_a_sync_first_and_never_trusts_a_claimed_spend(env):
     env.st.send_limit = 20
     a, b = pair(env, 20)
     assert env.c.post("/wallet/topup", json={"amount": 10, "pin": "1234"}, headers=a.h()).status_code == 400   # bank still counts 20 outstanding
     r = env.c.post("/wallet/topup", json={"amount": 10, "pin": "1234", "unsynced_spent": 10}, headers=a.h())
-    assert r.status_code == 200 and len(events(env, "topup_unsynced_spend")) == 1
-    assert env.c.post("/wallet/topup", json={"amount": 20, "pin": "1234", "unsynced_spent": 999}, headers=a.h()).status_code == 400  # lying cannot exceed the hard ceiling
+    assert r.status_code == 400 and r.json()["detail"] == "sync_first"                                       # a claimed spend buys nothing
+    assert a.wallet()["send_bucket"] == 20
+    # the honest route: the spend reaches the bank (logs settle), then the refill fits
+    a.sync(logs=sent(a, b, a.value_points()[:10]), wallet=a.snap(1, points=[p["pid"] for p in a.points[11:]]))
+    assert a.wallet()["send_bucket"] == 10
+    assert env.c.post("/wallet/topup", json={"amount": 10, "pin": "1234"}, headers=a.h()).status_code == 200
+
+
+def test_two_thousand_cap_cannot_be_doubled_by_a_false_unsynced_claim(env):
+    a = env.phone("+919000000001", "Asha"); a.register(); a.topup(2000)
+    r = env.c.post("/wallet/topup", json={"amount": 2000, "pin": "1234", "unsynced_spent": 2000}, headers=a.h())
+    assert r.status_code == 400 and a.wallet()["send_bucket"] == 2000
 
 
 def test_sudden_change_opens_review_only_and_never_freezes(env):
@@ -569,3 +583,140 @@ def test_held_claims_show_trust_and_review_sooner_for_higher_trust(env):
     cases = tok.get("/admin/same-id", headers={"Authorization": "Bearer " + t}).json()["cases"]
     held = [x for x in cases[0]["claimants"] if x["status"] == "held"][0]
     assert held["trust"] >= 300 and 12 <= held["review_within_hours"] <= 72
+
+
+# ---------- month rollover, local time, renewal ----------
+def _freeze(monkeypatch, env, when_utc):
+    """Pins the service clock. The service reads datetime.now(tz) for the calendar and datetime.now(timezone.utc) for grace."""
+    import nipay.service as sv
+    from datetime import datetime as real
+
+    class Fake(real):
+        @classmethod
+        def now(cls, tz=None):
+            return when_utc.astimezone(tz) if tz else when_utc
+    monkeypatch.setattr(sv, "datetime", Fake)
+    monkeypatch.setattr(sv, "now", lambda: when_utc)
+
+
+def test_month_follows_local_calendar_not_utc_and_rolls_over_by_itself(env, monkeypatch):
+    from datetime import datetime, timezone
+    env.st.tz_name = "Asia/Kolkata"
+    _freeze(monkeypatch, env, datetime(2026, 10, 31, 20, 0, tzinfo=timezone.utc))   # 1 Nov 01:30 in India, still 31 Oct in UTC
+    with env.app.state.SessionLocal() as db:
+        assert env.svc.current_month(db) == "2026-11"
+        assert env.svc.days_until_renewal(db) == 30          # renews 1 Dec, not "0 days"
+        assert env.svc.month_valid(db, "2026-10")             # last month rides on the grace period
+    _freeze(monkeypatch, env, datetime(2026, 10, 31, 15, 0, tzinfo=timezone.utc))   # 31 Oct 20:30 in India
+    with env.app.state.SessionLocal() as db:
+        assert env.svc.current_month(db) == "2026-10" and env.svc.days_until_renewal(db) == 1
+
+
+def test_grace_runs_from_calendar_month_start_and_ends(env, monkeypatch):
+    from datetime import datetime, timezone
+    env.st.tz_name = "Asia/Kolkata"
+    _freeze(monkeypatch, env, datetime(2026, 12, 8, 6, 0, tzinfo=timezone.utc))      # 37 days into Dec: inside the 38 day grace
+    with env.app.state.SessionLocal() as db:
+        assert env.svc.current_month(db) == "2026-12" and env.svc.month_valid(db, "2026-11")
+    _freeze(monkeypatch, env, datetime(2027, 1, 20, 6, 0, tzinfo=timezone.utc))      # 50 days after Dec 1 -> Nov... Dec is now previous and out of grace
+    with env.app.state.SessionLocal() as db:
+        assert env.svc.current_month(db) == "2027-01" and env.svc.month_valid(db, "2026-12")
+        assert not env.svc.month_valid(db, "2026-11")
+
+
+def test_wallet_gets_new_rules_on_sync_and_ids_renew_next_month(env, monkeypatch):
+    from datetime import datetime, timezone
+    env.st.tz_name = "Asia/Kolkata"
+    _freeze(monkeypatch, env, datetime(2026, 10, 20, 6, 0, tzinfo=timezone.utc))
+    a, b = pair(env, 10)
+    old = a.value_points()
+    assert old[0]["month"] == "2026-10"
+    _freeze(monkeypatch, env, datetime(2026, 10, 31, 20, 0, tzinfo=timezone.utc))    # it is 1 Nov for the user
+    r = a.sync(wallet={"points": [p["pid"] for p in a.points]})
+    assert r["rules"]["month"] == "2026-11" and r["previous_rules"]["month"] == "2026-10"
+    assert r["wallet"]["month"] == "2026-11" and r["wallet"]["days_until_renewal"] == 30
+    ren = env.c.post("/wallet/renew", json={"pids": [p["pid"] for p in old]}, headers=a.h()).json()
+    assert len([p for p in ren["points"] if p["kind"] == "value"]) == 10 and all(p["month"] == "2026-11" for p in ren["points"])
+    assert ren["wallet"]["send_bucket"] == 10                                         # no money moved
+    again = env.c.post("/wallet/renew", json={"pids": [p["pid"] for p in old]}, headers=a.h()).json()
+    assert again["points"] == []                                                      # the same old IDs are never renewed twice
+    new_ids = [p["pid"] for p in ren["points"] if p["kind"] == "value"]
+    assert env.c.post("/wallet/renew", json={"pids": new_ids}, headers=a.h()).json()["points"] == []   # current-month IDs are not renewed
+    assert b.claim(a.pay_to(b, old[0]))["status"] == "paid"                           # an old ID spent before renewal is still paid
+
+
+# ---------- items from the real-app test (payment-stress-sim/REALAPP_REPORT.md) ----------
+def _review_items(env, typ):
+    with env.app.state.SessionLocal() as db:
+        return db.scalars(select(ReviewItem).where(ReviewItem.type == typ)).all()
+
+
+def test_claims_route_runs_sudden_change_and_wallet_audit_like_sync(env):
+    env.st.sudden_change_min = 3
+    a, b = pair(env, 20)
+    r = env.c.post("/claims", json={"claims": [{k: v for k, v in e.items() if k != "receipt"} for e in received(a, b, a.value_points()[:6])]}, headers=b.h()).json()
+    assert [x["status"] for x in r["results"]] == ["paid"] * 6
+    assert len(_review_items(env, "SUDDEN_CHANGE")) == 1                       # /claims is no way around the review
+    assert "wallet_omitted" in r["wallet_audit"] and "wallet_omitted" in events(env)
+    r2 = env.c.post("/claims", json={"claims": [], "wallet": {"points": [], "seq": 1, "counter": 1, "month": a.points[0]["month"], "mines": []}}, headers=a.h()).json()
+    assert "wallet_count_low" in r2["wallet_audit"]                            # the audit ran on the claims route too
+
+
+def test_integrity_verify_matches_sync_for_lists_missing_and_wrong_digests(env):
+    a, b = pair(env)
+    with env.app.state.SessionLocal() as db:
+        env.svc.put_setting(db, "official_build_digest", "aaaaaaaa,bbbbbbbb"); db.commit()
+    v = lambda **k: env.c.post("/integrity/verify", json=k, headers=a.h()).json()["code_check"]
+    assert v(code_digest="aaaaaaaa") == "match" and v(code_digest="bbbbbbbb") == "match" and not events(env, "code_check")
+    assert v() == "missing" and len(events(env, "code_check")) == 1             # {} with builds registered is logged
+    assert v(code_digest="zzzzzzzz") == "mismatch" and len(events(env, "code_check")) == 2
+
+
+def test_partial_or_empty_wallet_snapshot_is_a_signal(env):
+    a, b = pair(env, 30)
+    ok = a.sync(wallet=a.snap(1))["wallet_audit"]
+    assert ok == [] and not events(env, "wallet_count_low") and not events(env, "wallet_incomplete")
+    assert "wallet_count_low" in a.sync(wallet=a.snap(2, points=[]))["wallet_audit"]             # holds 30 at the bank, says 0
+    out = a.sync(wallet={"points": [p["pid"] for p in a.points]})["wallet_audit"]                # seq, counter, month, mines left out
+    assert "wallet_incomplete" in out and events(env, "wallet_incomplete")
+    assert "wallet_incomplete" in a.sync(wallet=a.snap(3, seq=None))["wallet_audit"]
+    assert "wallet_incomplete" in a.sync(wallet=a.snap(3, mines=None))["wallet_audit"]
+    assert "wallet_incomplete" in a.sync(wallet=a.snap(3, month=None))["wallet_audit"]
+    assert "wallet_incomplete" in a.sync(wallet=a.snap(3, counter=None))["wallet_audit"]
+    assert a.wallet()["offline_suspended"] is False and a.wallet()["send_bucket"] == 30            # signals only: nothing frozen, no money moved
+
+
+def test_honest_spend_then_sync_is_not_a_count_signal(env):
+    a, b = pair(env, 20)
+    spent = a.value_points()[:5]
+    a.sync(logs=sent(a, b, spent), wallet=a.snap(1, points=[p["pid"] for p in a.value_points()[5:]] + [a.points[0]["pid"]]))
+    assert not events(env, "wallet_count_low")
+
+
+def test_repeated_sequence_number_with_new_payments_is_logged_like_a_backward_one(env):
+    a, b = pair(env, 20)
+    pts = a.value_points()
+    assert a.sync(wallet=a.snap(4))["wallet_audit"] == []
+    assert a.sync(wallet=a.snap(4))["wallet_audit"] == []                                         # a quiet phone repeats its number: normal
+    rest = [p["pid"] for p in pts[3:]] + [a.points[0]["pid"]]
+    out = a.sync(logs=sent(a, b, pts[:3]), wallet=a.snap(4, points=rest))                     # but three new payments and the number did not move
+    assert "restore" in out["wallet_audit"]
+    assert any("did not move" in e.description for e in events(env, "restore"))
+    out = a.sync(logs=sent(a, b, pts[3:5]), wallet=a.snap(5, points=[p["pid"] for p in pts[5:]] + [a.points[0]["pid"]]))
+    assert "restore" not in out["wallet_audit"]                                                   # a number that moved is fine
+
+
+def test_super_admin_registers_official_builds_and_checks_use_them(env):
+    a, b = pair(env)
+    assert a.sync(wallet=a.snap())["code_check"] == "no_official_build_registered"
+    h = admin(env)
+    assert env.c.post("/admin/builds", json={"digest": "abcdef012345"}, headers=h).json()["digests"] == ["abcdef012345"]
+    assert a.sync(wallet=a.snap(), code_digest="abcdef012345")["code_check"] == "match"
+    assert env.c.post("/integrity/verify", json={"code_digest": "abcdef012345"}, headers=a.h()).json()["code_check"] == "match"
+    assert env.c.post("/claims", json={"claims": [], "wallet": a.snap(), "code_digest": "nope-nope-nope"}, headers=a.h()).json()["code_check"] == "mismatch"
+    assert env.c.post("/admin/builds", json={"digest": "has space  x"}, headers=h).status_code == 400
+    assert env.c.post("/admin/builds", json={"digest": "abcdef012345"}, headers=a.h()).status_code == 403     # a phone token is not an admin
+    ro = admin(env, "auditor")
+    assert env.c.post("/admin/builds", json={"digest": "zzzzzzzzzz"}, headers=ro).status_code == 403          # read-only role cannot register
+    assert env.c.get("/admin/builds", headers=ro).status_code == 200
+    assert env.c.post("/admin/builds/remove", json={"digest": "abcdef012345"}, headers=h).json()["digests"] == []
