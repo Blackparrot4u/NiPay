@@ -133,6 +133,10 @@ export class LinkSession {
     } else if (kind === 1 && this.state === 'authenticated') this.onMessage(body);
     else this.rejected++;
   }
+  /** Bytes queued in the data channel: the transfer layer waits on this so a big payment does not flood it. */
+  buffered() { return this.dc?.bufferedAmount ?? 0; }
+  /** Test hook: cut the link as if the phones moved apart. */
+  simulateDrop() { try { this.dc?.close(); this.pc.close(); } catch { /* closed */ } this.set('failed'); }
   send(app: Uint8Array) { if (this.state === 'authenticated') this.raw(concat(new Uint8Array([1]), app)); }
   /** Test hook: a "third device" that does not know the key tries to inject a frame. */
   injectForgery() { if (this.dc?.readyState === 'open') this.dc.send(seal(randomBytes(32), 99, this.myDir, enc.encode('evil')) as any); }

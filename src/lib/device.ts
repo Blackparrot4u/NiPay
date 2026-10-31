@@ -22,12 +22,12 @@ export interface State {
   queuedReports: { type: string; pid: string; description: string }[];
   server: any | null; history: any[]; lastSync: string | null; lastSyncOk: boolean;
   trace: string[]; locked: boolean;
-  cert: Cert | null; crossReports: CrossReport[];
+  cert: Cert | null; crossReports: CrossReport[]; passkeyId: string | null; selfieDone: boolean;
 }
 const empty = (): State => {
   const kp = newKeypair();
   return { seed: b64(kp.seed), pub: b64(kp.pub), token: null, phone: '', name: '', pinHash: '', pinSalt: '', language: 'en', bankPub: '', docs: [], notices: [], trust: null,
-    points: [], inflight: [], mines: [], seq: 0, received: [], sent: [], queuedReports: [], server: null, history: [], lastSync: null, lastSyncOk: false, trace: [], locked: false, cert: null, crossReports: [] };
+    points: [], inflight: [], mines: [], seq: 0, received: [], sent: [], queuedReports: [], server: null, history: [], lastSync: null, lastSyncOk: false, trace: [], locked: false, cert: null, crossReports: [], passkeyId: null, selfieDone: false };
 };
 
 const slot = (typeof location !== 'undefined' && new URLSearchParams(location.search).get('slot')) || 'main';
@@ -213,7 +213,8 @@ export { signReceipt, verifyReceipt, auditMines, ALPHA };
 export function matchCode(ref: string, nonce: string): string {
   return String(sha256b(enc.encode(ref + '|' + nonce))[0] % 100).padStart(2, '0');
 }
-export const MAX_QR_POINTS = 60; // 148 bytes/point over animated QR: more than this is too slow to scan
+/** One payment over the encrypted link: up to the whole send bucket. */
+export const MAX_PAYMENT = 2000;
 
 // ---------- mutual check at connection ----------
 /** Own integrity signal as far as a browser can give one: wallet not locked and sequence equals the (simulated) counter. Play Integrity / App Attest are native-app only. */
