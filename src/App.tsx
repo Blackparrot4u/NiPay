@@ -5,6 +5,7 @@ import { Home, TopUp, Move, History, More, useOnline } from './screens/Main';
 import { Pay } from './screens/Pay';
 import { Receive } from './screens/Receive';
 import { Inspect } from './screens/Inspect';
+import { Selfie } from './screens/Selfie';
 import { Badge } from './ui';
 
 const useRoute = () => {
@@ -29,6 +30,7 @@ export default function App() {
     case '/history': view = <History />; break;
     case '/move': view = <Move />; break;
     case '/more': view = <More />; break;
+    case '/selfie': view = <Selfie />; break;
     case '/inspect': view = <Inspect />; break;
     default: view = <Home />;
   }

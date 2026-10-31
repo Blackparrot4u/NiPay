@@ -22,6 +22,7 @@ class Settings:
     rate_limit_per_min: int = int(os.environ.get("NIPAY_RATE_LIMIT", "600"))
     login_rate_per_min: int = int(os.environ.get("NIPAY_LOGIN_RATE", "20"))
     grace_days: int = 38  # design: 35-40 days after month end
+    topup_fee: int = 1
     send_limit: int = 2000
     receive_limit: int = 10000
     simultaneous_alert: int = 10  # claimants on one point that raise an alert

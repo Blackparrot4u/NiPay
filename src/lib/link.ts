@@ -59,7 +59,7 @@ export class LinkSession {
     this.life = setTimeout(() => this.destroy(), LINK_TIMEOUT_MS);
     this.pc.addEventListener('connectionstatechange', () => { if (['failed', 'closed'].includes(this.pc.connectionState) && this.state !== 'destroyed') this.set('failed'); });
   }
-  private set(s: LinkState) { if (this.state === 'destroyed') return; this.state = s; this.onState(s); }
+  private set(s: LinkState) { if (this.state === 'destroyed') return; this.state = s; if (typeof localStorage !== 'undefined' && localStorage.getItem('nipay:debug')) console.log('link', this.role, s); this.onState(s); }
 
   /** Payer: makes the offer that goes into a QR. */
   async createOffer() {

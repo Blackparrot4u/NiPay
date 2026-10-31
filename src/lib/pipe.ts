@@ -40,6 +40,8 @@ export class Pipe {
     for (let i = from; i < total; i++) {
       while (l.state === 'authenticated' && l.buffered() > 256 * 1024) await new Promise((r) => setTimeout(r, 15));
       if (l.state !== 'authenticated' || this.link !== l) break;   // dropped: resume later
+      const hook = (globalThis as any).__nipayDropAtPart;           // test hook (like __nipayForgeOnOpen): cut the link at part N
+      if (hook === i + 1) { (globalThis as any).__nipayDropAtPart = undefined; l.simulateDrop(); break; }
       const hdr = new Uint8Array(1 + 1 + idb.length + 4); hdr[0] = T.D; hdr[1] = idb.length; hdr.set(idb, 2);
       new DataView(hdr.buffer).setUint32(2 + idb.length, i);
       l.send(concat(hdr, o.bytes.subarray(i * CHUNK, (i + 1) * CHUNK)));

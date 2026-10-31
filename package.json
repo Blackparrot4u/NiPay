@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite -c vite.user.config.ts",
-    "build": "tsc --noEmit && vite build -c vite.user.config.ts && vite build -c vite.admin.config.ts",
+    "build": "rm -rf dist && tsc --noEmit && vite build -c vite.user.config.ts && vite build -c vite.admin.config.ts",
     "preview": "vite preview -c vite.user.config.ts",
     "lint": "tsc --noEmit",
     "test:vectors": "tsx scripts/vectors.test.ts",

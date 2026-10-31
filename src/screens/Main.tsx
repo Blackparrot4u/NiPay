@@ -5,6 +5,7 @@ import { addTopupPoints, checkPin, controlKey, get, hwCounter, refreshWallet, re
 import { logout, fetchRules } from '../lib/actions';
 import { QrDisplay } from '../components/QrDisplay';
 import { enc } from '../lib/crypto';
+import { enablePasskey, passkeySupported } from '../lib/unlock';
 
 function WifiShare() {
   const [ssid, setSsid] = useState(''); const [pw, setPw] = useState('');
@@ -39,8 +40,8 @@ export function Home() {
       {blocked && <Card className="border-red-300 bg-red-50 text-sm text-red-700"><span data-testid="blocked">{bat !== null && bat < 3 ? t('battery') : t('attention')}</span></Card>}
       {expired && <Notice>No signed rules on this phone yet. Go online once to load them.</Notice>}
       <div className="grid grid-cols-2 gap-3">
-        <Card><p className="text-xs text-slate-500">{t('send_bucket')}</p><p className="text-2xl font-bold" data-testid="send-bal">{spendable().length}</p><p className="text-[11px] text-slate-400">points on this phone (max {s?.send_limit ?? 2000})</p></Card>
-        <Card><p className="text-xs text-slate-500">{t('receive_bucket')}</p><p className="text-2xl font-bold" data-testid="recv-bal">{(s?.receive_bucket ?? 0) + receiveLocal}</p><p className="text-[11px] text-slate-400">{receiveLocal ? `${receiveLocal} waiting for sync` : 'settled at the bank'} (max {s?.receive_limit ?? 10000})</p></Card>
+        <Card><p className="text-xs text-slate-500">{t('send_bucket')}</p><p className="text-2xl font-bold" data-testid="send-bal">{spendable().length}</p><p className="text-[11px] text-slate-400">points on this phone {s?.send_limit != null ? `(max ${s.send_limit})` : ''}</p></Card>
+        <Card><p className="text-xs text-slate-500">{t('receive_bucket')}</p><p className="text-2xl font-bold" data-testid="recv-bal">{(s?.receive_bucket ?? 0) + receiveLocal}</p><p className="text-[11px] text-slate-400">{receiveLocal ? `${receiveLocal} waiting for sync` : 'settled at the bank'} {s?.receive_limit != null ? `(max ${s.receive_limit})` : ''}</p></Card>
       </div>
       <Card className="flex justify-between text-sm"><span className="text-slate-500">Main account (bank)</span><b data-testid="main-bal">Rs {s?.main_balance ?? '-'}</b></Card>
       <div className="grid grid-cols-3 gap-2">
@@ -71,15 +72,15 @@ export function TopUp() {
     try {
       const r = await api('/wallet/topup', { body: { amount: a, pin }, token: d.token });
       addTopupPoints(r.points); set({ server: r.wallet }); await fetchRules();
-      setOk(`Added ${a} points (+1 control key). Rs ${a + 1} left your main account.`); 
+      setOk(`Added ${a} points (+1 control key). Rs ${a + (get().server?.topup_fee ?? 0)} left your main account.`); 
     } catch (e) { setErr(errText(e)); }
   };
   return (
     <div className="space-y-3">
       <Title back="/" sub="Needs internet. Fake money.">Add points</Title>
-      <Card className="text-sm space-y-1"><div className="flex justify-between"><span>Main account</span><b>Rs {d.server?.main_balance}</b></div><div className="flex justify-between"><span>Points on phone</span><b>{spendable().length} / {d.server?.send_limit ?? 2000}</b></div>
-        <div className="flex justify-between"><span>Fee</span><b>Rs 1</b></div><div className="flex justify-between border-t pt-1"><span>You pay</span><b>Rs {a + 1}</b></div></Card>
-      <Field label="Points to add (max 2,000 in total)" inputMode="numeric" value={amount} onChange={(e) => setAmount(e.target.value)} data-testid="tu-amount" />
+      <Card className="text-sm space-y-1"><div className="flex justify-between"><span>Main account</span><b>Rs {d.server?.main_balance}</b></div><div className="flex justify-between"><span>Points on phone</span><b>{spendable().length}{d.server?.send_limit != null ? ` / ${d.server.send_limit}` : ''}</b></div>
+        <div className="flex justify-between"><span>Fee</span><b>{d.server?.topup_fee != null ? `Rs ${d.server.topup_fee}` : '-'}</b></div><div className="flex justify-between border-t pt-1"><span>You pay</span><b>{d.server?.topup_fee != null ? `Rs ${a + d.server.topup_fee}` : '-'}</b></div></Card>
+      <Field label={`Points to add${d.server?.send_limit != null ? ` (max ${d.server.send_limit} in total)` : ''}`} inputMode="numeric" value={amount} onChange={(e) => setAmount(e.target.value)} data-testid="tu-amount" />
       <Field label="PIN" type="password" inputMode="numeric" value={pin} onChange={(e) => setPin(e.target.value)} data-testid="tu-pin" />
       <Err msg={err} />{ok && <Notice tone="sky">{ok}</Notice>}
       <Btn disabled={!online || a < 1} onClick={go_} data-testid="tu-submit">Confirm with PIN</Btn>
@@ -136,10 +137,28 @@ export function More() {
         <p>Not possible in a browser, planned for the native app: Play Integrity (Android), App Attest (iPhone), root and emulator detection, a real hardware counter, self-lock, Bluetooth peripheral mode, NFC tap pairing, biometric unlock.</p>
         <p>Test data only: no real Aadhaar, PAN or bank data is stored. Fake money.</p></Card>
       <WifiShare />
+      <Security />
       <Btn kind="ghost" onClick={() => go('/inspect')}>Mine inspector</Btn>
       {d.locked && <Card className="text-xs space-y-1"><p>This wallet looks restored from a copy, so it is locked (self-lock). On a real phone you would upload documents to support. Demo shortcut:</p><Btn kind="ghost" onClick={() => set({ locked: false, seq: hwCounter() })}>Support approved: unlock (demo)</Btn></Card>}
       <Btn kind="ghost" onClick={async () => { await logout(); go('/welcome'); }}>Sign out</Btn>
       <Btn kind="ghost" onClick={() => { if (confirm('Erase this phone\'s keys and points? (Test only)')) { resetDevice(); go('/welcome'); } }}>Erase this demo phone</Btn>
     </div>
+  );
+}
+
+/** Fingerprint/face unlock (WebAuthn passkey, HTTPS only, PIN stays as fallback) and the demo selfie (consent, delete). */
+function Security() {
+  const d = useDevice(); const [m, setM] = useState('');
+  const [selfie, setSelfie] = useState<boolean | null>(null);
+  useEffect(() => { api('/selfie/status', { token: d.token }).then((r) => setSelfie(r.stored)).catch(() => setSelfie(null)); }, [d.token, m]);
+  return (
+    <Card className="space-y-2"><p className="font-semibold text-sm">Unlock and selfie</p>
+      {passkeySupported()
+        ? (d.passkeyId ? <div className="flex gap-2"><Badge tone="green">Fingerprint or face unlock is on</Badge><button className="underline text-xs" onClick={() => set({ passkeyId: null })}>turn off</button></div>
+          : <Btn kind="ghost" data-testid="enable-passkey" onClick={async () => setM((await enablePasskey()) ?? 'Fingerprint or face unlock is on. The PIN still works as a fallback.')}>Turn on fingerprint or face unlock</Btn>)
+        : <p className="text-xs text-slate-500">Fingerprint or face unlock needs HTTPS (open the secure link). PIN is used until then.</p>}
+      {selfie === true && <div className="flex justify-between text-xs"><span>A demo selfie is stored on the server for this account.</span><button className="underline" data-testid="selfie-delete" onClick={async () => { await api('/selfie', { method: 'DELETE', token: d.token }).catch(() => {}); setM('Selfie deleted.'); }}>delete it</button></div>}
+      {selfie === false && <button className="underline text-xs" onClick={() => go('/selfie')}>Add a demo selfie (with consent)</button>}
+      {m && <Notice tone="sky">{m}</Notice>}</Card>
   );
 }

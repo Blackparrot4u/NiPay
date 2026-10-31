@@ -73,10 +73,10 @@ export function recipeFor(month: string): Recipe | null {
   const blob = d && acceptSigned(bankPubBytes(), d.mine);
   return blob ? parseRecipe(blob) : null;
 }
-export function policy(month: string): { send: number; recv: number; grace: number } {
+export function policy(month: string): { send: number; recv: number; grace: number } | null {
   const d = state.docs.find((x) => x.month === month);
   const blob = d && acceptSigned(bankPubBytes(), d.policy);
-  return blob ? JSON.parse(new TextDecoder().decode(blob)) : { send: 2000, recv: 10000, grace: 38 };
+  return blob ? JSON.parse(new TextDecoder().decode(blob)) : null;
 }
 /** Accepts a rules package only if the bank signed all of it. Used for sync AND for phone-to-phone passing. */
 export function acceptRulesDoc(doc: Docs): boolean {
@@ -112,6 +112,15 @@ export function addTopupPoints(points: StoredPoint[]) {
 }
 
 /** Picks points in KT's spend order, locks them as in flight, and signs the handover to `to`. */
+/** Restore detection before anything is sent: the wallet sequence must equal the (simulated) hardware counter. Locks the wallet if not. */
+export function walletUsable(): boolean {
+  if (state.locked || state.seq !== hwCounter()) {
+    if (!state.locked) queueReport('restore', '', 'wallet sequence behind the hardware counter: wallet was restored from a copy');
+    set({ locked: true });
+    return false;
+  }
+  return true;
+}
 export function prepareSpend(n: number, to: string, month: string): { pid: string; month: string; sig: Uint8Array; handover: Uint8Array }[] {
   const s = state;
   // restore detection: the wallet sequence must equal the (simulated) hardware counter

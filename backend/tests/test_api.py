@@ -448,3 +448,16 @@ def test_two_portals_are_separate_apps(env):
     assert user.options("/wallet", headers={"Origin": "http://localhost:8001", "Access-Control-Request-Method": "GET"}).headers.get("access-control-allow-origin") is None
     assert admin.options("/admin/overview", headers={"Origin": "http://localhost:8000", "Access-Control-Request-Method": "GET"}).headers.get("access-control-allow-origin") is None
     assert admin.options("/admin/overview", headers={"Origin": "http://localhost:8001", "Access-Control-Request-Method": "GET"}).headers.get("access-control-allow-origin") == "http://localhost:8001"
+
+
+def test_selfie_needs_consent_is_stored_outside_git_and_can_be_deleted(env):
+    import os
+    a, b = pair(env)
+    jpg = "data:image/jpeg;base64," + base64.b64encode(b"\xff\xd8\xff\xe0" + b"x" * 50).decode()
+    assert env.c.post("/selfie", json={"image": jpg, "consent": False}, headers=a.h()).status_code == 400
+    assert env.c.post("/selfie", json={"image": "data:image/png;base64,AAAA", "consent": True}, headers=a.h()).status_code == 400
+    assert env.c.post("/selfie", json={"image": jpg, "consent": True}, headers=a.h()).json() == {"stored": True}
+    assert os.path.exists(os.path.join(env.dir, "selfies"))
+    assert env.c.get("/selfie/status", headers=a.h()).json() == {"stored": True} and env.c.get("/selfie/status", headers=b.h()).json() == {"stored": False}
+    assert env.c.delete("/selfie", headers=a.h()).json()["deleted"] is True
+    assert env.c.get("/selfie/status", headers=a.h()).json() == {"stored": False}

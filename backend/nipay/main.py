@@ -1,4 +1,5 @@
 """NiPay API. Fake money and test data only. See README for what is real and what is simulated."""
+import base64
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -88,6 +89,11 @@ class AppealIn(BaseModel):
     reason: str = Field(min_length=3)
     kind: str = "flag"
     documents: list[str] = []
+
+
+class SelfieIn(BaseModel):
+    image: str  # data URL (image/jpeg), taken with the camera at sign-up
+    consent: bool = False
 
 
 class IntegrityIn(BaseModel):
@@ -190,7 +196,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         return {"id": u.id, "name": u.name, "phone": u.phone, "bank": u.bank, "region": u.region, "language": u.language,
                 "kyc_status": u.kyc_status, "kyc_note": "test data only; no real Aadhaar/PAN is stored",
                 "main_balance": u.main_balance, "send_bucket": u.send_bucket, "receive_bucket": u.receive_bucket,
-                "send_limit": st.send_limit, "receive_limit": st.receive_limit, "offline_suspended": u.offline_suspended,
+                "send_limit": st.send_limit, "receive_limit": st.receive_limit, "topup_fee": st.topup_fee, "offline_suspended": u.offline_suspended,
                 "suspend_reason": u.suspend_reason, "month": cur, "days_until_renewal": max(0, (nxt - datetime.now(timezone.utc)).days),
                 "grace_days": st.grace_days, "pending_transfers": pending,
                 "last_sync_at": u.last_sync_at.isoformat() if u.last_sync_at else None,
@@ -205,6 +211,11 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
     @app.get("/health")
     def health():
         return {"ok": True}
+
+    @app.get("/meta")
+    def meta():
+        """Choices the sign-up form shows, so the app carries no baked lists. The OTP is a labelled demo value (no SMS exists)."""
+        return {"banks": list(BANKS), "regions": ["Plains", "Hills", "Snow region"], "demo_otp": st.otp, "demo_otp_note": "MOCK: no SMS is sent in this demo; this fixed code works for everyone."}
 
     @app.get("/bank/public-key")
     def public_key():
@@ -323,7 +334,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
             ctx.db.rollback()
             bad(r.code)
         ctx.db.commit()
-        return {"points": pts, "fee": 1, "wallet": wallet_view(ctx.db, ctx.user, ctx.device)}
+        return {"points": pts, "fee": st.topup_fee, "wallet": wallet_view(ctx.db, ctx.user, ctx.device)}
 
     @app.post("/wallet/move-to-main")
     def move_to_main(body: MoveIn, ctx: Ctx = Depends(user_ctx)):
@@ -338,7 +349,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
     # ---------- sync and claims ----------
     def run_logs(ctx: Ctx, logs: list) -> list:
         out = []
-        for e in logs[:500]:
+        for e in logs[:2500]:
             role = "claimant" if e.get("role") in ("received", "claimant") else "sender"
             try:
                 out.append(svc.process_transfer(ctx.db, ctx.user, role, e))
@@ -367,7 +378,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
     @app.post("/claims")
     def claims(body: ClaimsIn, ctx: Ctx = Depends(user_ctx)):
         res = []
-        for e in body.claims[:500]:
+        for e in body.claims[:2500]:
             try:
                 res.append(svc.process_transfer(ctx.db, ctx.user, "claimant", e))
             except Rejected as r:
@@ -429,6 +440,42 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
                 svc.event(ctx.db, "code_check", "HIGH", ctx.user.id, "", "code block digest does not match the official build")
                 ctx.db.commit()
         return out
+
+    # ---------- selfie (team demo only) ----------
+    # Stored as a file in the gitignored data folder (backend/data/selfies). No face matching is built or claimed.
+    def selfie_path(u: User):
+        d = st.data_dir / "selfies"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"user{u.id}.jpg"
+
+    @app.get("/selfie/status")
+    def selfie_status(ctx: Ctx = Depends(user_ctx)):
+        return {"stored": selfie_path(ctx.user).exists()}
+
+    @app.post("/selfie")
+    def selfie_put(body: SelfieIn, ctx: Ctx = Depends(user_ctx)):
+        if not body.consent:
+            bad("consent_required")
+        m = re.match(r"^data:image/jpeg;base64,([A-Za-z0-9+/=]+)$", body.image)
+        raw = base64.b64decode(m.group(1)) if m else b""
+        if not raw or len(raw) > 400_000 or raw[:3] != b"\xff\xd8\xff":
+            bad("bad_image")
+        p = selfie_path(ctx.user)
+        p.write_bytes(raw)
+        p.chmod(0o600)
+        svc.audit(ctx.db, ctx.user.phone, "USER", "SELFIE_STORED", "demo selfie, consent given", "")
+        ctx.db.commit()
+        return {"stored": True}
+
+    @app.delete("/selfie")
+    def selfie_delete(ctx: Ctx = Depends(user_ctx)):
+        p = selfie_path(ctx.user)
+        existed = p.exists()
+        if existed:
+            p.unlink()
+        svc.audit(ctx.db, ctx.user.phone, "USER", "SELFIE_DELETED", "", "")
+        ctx.db.commit()
+        return {"stored": False, "deleted": existed}
 
     # ---------- reports and appeals ----------
     @app.post("/reports")
@@ -522,6 +569,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
             out.append({"id": u.id, "name": u.name, "phone": u.phone, "kyc_status": u.kyc_status, "bank": u.bank, "region": u.region,
                         "main_balance": u.main_balance, "send_bucket": u.send_bucket, "receive_bucket": u.receive_bucket, "trust": score,
                         "offline_suspended": u.offline_suspended, "suspend_reason": u.suspend_reason, "last_sync_at": iso(u.last_sync_at),
+                        "selfie_on_file": (st.data_dir / "selfies" / f"user{u.id}.jpg").exists(),
                         "devices": [{"label": d.label, "active": d.active, "cancel_reason": d.cancel_reason} for d in devs]})
         return {"users": out}
 
@@ -615,7 +663,7 @@ def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI
         db = ctx.db
         cur = svc.current_month(db)
         return {"month": cur, "previous_month": svc.prev_month(cur), "previous_in_grace": svc.month_valid(db, svc.prev_month(cur)),
-                "grace_days": st.grace_days, "rotated_at": iso(svc.rotated_at(db)), "send_limit": st.send_limit, "receive_limit": st.receive_limit,
+                "grace_days": st.grace_days, "rotated_at": iso(svc.rotated_at(db)), "send_limit": st.send_limit, "receive_limit": st.receive_limit, "topup_fee": st.topup_fee,
                 "bad_id_notices": db.scalar(select(func.count()).select_from(Notice)), "bank_public_key": svc.pub_b64,
                 "points_issued_this_month": db.scalar(select(func.count()).select_from(Point).where(Point.month == cur)),
                 "secrets": "seed and signing key are held on the server only and are not displayed"}

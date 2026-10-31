@@ -64,7 +64,7 @@ export function Receive() {
     const chk = checkIncoming(m.points, m.meta.month);
     const pk = unb64(m.meta.pk);
     const badHandover = m.points.filter((p) => !verify(pk, `${m.meta.month}|${p.pid}|${d.phone}`, p.handover));
-    const cap = (d.server?.receive_bucket ?? 0) + d.received.filter((r) => !r.synced).length + m.points.length > (d.server?.receive_limit ?? 10000);
+    const cap = (d.server?.receive_bucket ?? 0) + d.received.filter((r) => !r.synced).length + m.points.length > (d.server?.receive_limit ?? peer.current?.cert?.lr ?? Infinity) /* limit comes from the server or the signed certificate; unknown means no local cap */;
     const overSend = !checkLimit(peer.current?.cert, 'payer', m.points.length);
     const bad = !chk.ok || m.meta.to !== d.phone || badHandover.length > 0 || cap || overSend || (bat !== null && bat < 3) || m.points.length === 0;
     if (bad) {

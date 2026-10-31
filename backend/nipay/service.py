@@ -153,7 +153,7 @@ class Svc:
         has_control = db.scalar(select(func.count()).select_from(Point).where(
             Point.owner_id == user.id, Point.device_id == device.id, Point.kind == "control", Point.month == month))
         # ledger first: it raises before any ID exists if the money is not there
-        self.move(db, "topup", user, ref=f"{amount} points", main=-(amount + 1), send=amount, fees=1)
+        self.move(db, "topup", user, ref=f"{amount} points", main=-(amount + self.s.topup_fee), send=amount, fees=self.s.topup_fee)
         rules, out = self.bank.rules(month), []
         need = amount + (0 if has_control else 1)
         for i in range(need):

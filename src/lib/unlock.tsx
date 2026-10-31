@@ -14,8 +14,8 @@ export async function enablePasskey(): Promise<string | null> {
   const s = get();
   try {
     const cred = (await navigator.credentials.create({ publicKey: {
-      challenge: randomBytes(32), rp: { name: 'NiPay prototype', id: location.hostname },
-      user: { id: randomBytes(16), name: s.phone || 'nipay-user', displayName: s.name || 'NiPay user' },
+      challenge: randomBytes(32) as BufferSource, rp: { name: 'NiPay prototype', id: location.hostname },
+      user: { id: randomBytes(16) as BufferSource, name: s.phone || 'nipay-user', displayName: s.name || 'NiPay user' },
       pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
       authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'preferred' }, timeout: 60000 } })) as PublicKeyCredential | null;
     if (!cred) return 'Cancelled.';
@@ -26,7 +26,7 @@ export async function enablePasskey(): Promise<string | null> {
 export async function passkeyUnlock(): Promise<boolean> {
   const id = get().passkeyId; if (!id || !passkeySupported()) return false;
   try {
-    const a = await navigator.credentials.get({ publicKey: { challenge: randomBytes(32), rpId: location.hostname, userVerification: 'required', allowCredentials: [{ type: 'public-key', id: unb64(id) }], timeout: 60000 } });
+    const a = await navigator.credentials.get({ publicKey: { challenge: randomBytes(32) as BufferSource, rpId: location.hostname, userVerification: 'required', allowCredentials: [{ type: 'public-key', id: unb64(id) as BufferSource }], timeout: 60000 } });
     if (a) { lastOk = Date.now(); return true; }
   } catch { /* cancelled */ }
   return false;

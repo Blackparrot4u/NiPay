@@ -8,7 +8,7 @@ import { verifyReceipt } from '../lib/idsystem';
 import { LinkSession, onlyMdns } from '../lib/link';
 import { Pipe, Progress } from '../lib/pipe';
 import { checkLimit, PeerCard } from '../lib/peercheck';
-import { Held, MAX_PAYMENT, acceptableMonths, finishSpend, mutualCheck, ownCard, prepareSpend, recordCross, releaseInflight, spendable, useDevice } from '../lib/device';
+import { Held, MAX_PAYMENT, acceptableMonths, finishSpend, mutualCheck, ownCard, prepareSpend, recordCross, releaseInflight, spendable, useDevice, walletUsable } from '../lib/device';
 import { ConnectionMethods, ProgressBar } from './parts';
 import { unlock, UnlockField } from '../lib/unlock';
 
@@ -44,7 +44,7 @@ export function Pay() {
     setErr(null); const n = parseInt(amount, 10);
     const bat = await batteryPercent();
     if (bat !== null && bat < 3) { setErr(t('battery')); return null; }
-    if (d.server?.offline_suspended || d.locked) { setErr(t('attention')); return null; }
+    if (d.server?.offline_suspended || d.locked || !walletUsable()) { setErr(t('attention')); return null; }
     if (!(await unlock(pin))) { setErr('Wrong PIN.'); return null; }
     if (!Number.isInteger(n) || n < 1) { setErr('Enter a whole amount of at least 1.'); return null; }
     if (n > MAX_PAYMENT) { setErr(`At most ${MAX_PAYMENT} points in one payment.`); return null; }
@@ -82,7 +82,7 @@ export function Pay() {
   const start = async () => {
     const pf = live.current.pending ?? await preflight(); if (!pf || !card) return;
     live.current.pending = pf; setNote('');
-    const ls = new LinkSession('payer', unb64(d.seed), unb64(d.pub)); link.current = ls; setStep('offer');
+    const ls = new LinkSession('payer', unb64(d.seed), unb64(d.pub)); link.current = ls; setFrames([]); setStep('offer');   // empty until the new offer exists: never show a stale offer
     const o = await ls.createOffer();
     if (onlyMdns(o.sdp)) setNote('This phone only offers mDNS (.local) addresses; the link may not open. Join the same hotspot and retry.');
     setFrames(toFrames(encodeMessage({ type: 'offer', meta: { ...o, pc: ownCard(b64(randomBytes(6))) } }), 420));
