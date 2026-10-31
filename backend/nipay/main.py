@@ -13,7 +13,7 @@ from .config import ADMIN_USERS, Settings, load_secrets
 from .core.idsystem import verify_sig
 from .core.wallet import code_digest, choose_block
 from .db import Base, make_engine, make_session_factory
-from .models import (Appeal, AuditLog, Device, LedgerEntry, Notice, Point, Report, ReviewItem, SecurityEvent,
+from .models import (Appeal, AuditLog, CrossReport, Device, LedgerEntry, Notice, Point, Report, ReviewItem, SecurityEvent,
                      SettlementBatch, Session, Setting, Transfer, User, now)
 from .security import PinGuard, RateLimiter, check_pin, hash_pin, hash_token, new_token
 from .service import Rejected, Svc, b64, unb64
@@ -70,6 +70,7 @@ class SyncIn(BaseModel):
     logs: list[dict] = []
     reports: list[dict] = []
     wallet: dict | None = None
+    cross_reports: list[dict] = []
     client_time: str = ""
 
 
@@ -111,7 +112,8 @@ class SuspendIn(BaseModel):
     reason: str = Field(min_length=3)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI:
+    """portal 'user' serves only the phone API, 'admin' only /admin/*. 'all' (tests) serves both. Two separate servers in production."""
     st = settings or Settings()
     store = load_secrets(st.data_dir)
     svc = Svc(st, store)
@@ -123,7 +125,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="NiPay demo API", version="0.2")
     app.state.svc, app.state.SessionLocal, app.state.settings = svc, SessionLocal, st
-    app.add_middleware(CORSMiddleware, allow_origins=list(st.cors_origins), allow_credentials=False,
+    app.add_middleware(CORSMiddleware, allow_origins=list(st.admin_cors_origins if portal == "admin" else st.cors_origins), allow_credentials=False,
                        allow_methods=["*"], allow_headers=["*"])
 
     @app.middleware("http")
@@ -353,13 +355,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if t in TRIPWIRES:
                 svc.event(db, t, "MEDIUM", u.id, str(r.get("pid", ""))[:20], str(r.get("description", ""))[:300], source="phone")
         problems = svc.audit_wallet(db, u, ctx.device, body.wallet) if body.wallet else []
+        cross = svc.ingest_cross_reports(db, u, ctx.device, body.cross_reports, problems)
         u.last_sync_at = now()
         db.add(Report(user_id=u.id, kind="sync", detail=json.dumps({"logs": len(body.logs), "reports": len(body.reports), "problems": problems})))
         db.commit()
         cur = svc.current_month(db)
         return {"results": results, "wallet_audit": problems, "server_time": now().isoformat(),
                 "wallet": wallet_view(db, u, ctx.device), "rules": svc.rules_doc(db, cur), "notices": svc.notices_doc(db),
-                "trust": svc.trust_doc(db, u)}
+                "trust": svc.trust_doc(db, u, ctx.device), "cross_reports": cross}
 
     @app.post("/claims")
     def claims(body: ClaimsIn, ctx: Ctx = Depends(user_ctx)):
@@ -407,7 +410,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/trust/certificate")
     def trust_cert(ctx: Ctx = Depends(user_ctx)):
-        return svc.trust_doc(ctx.db, ctx.user)
+        return svc.trust_doc(ctx.db, ctx.user, ctx.device)
 
     @app.post("/integrity/verify")
     def integrity(body: IntegrityIn, ctx: Ctx = Depends(user_ctx)):
@@ -701,18 +704,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"chain_intact": svc.audit_chain_ok(ctx.db),
                 "entries": [{"id": r.id, "at": iso(r.ts), "actor": r.actor, "role": r.role, "action": r.action, "target": r.target, "ip": r.ip} for r in rows]}
 
+    @app.get("/admin/cross-reports")
+    def a_cross(ctx: Ctx = Depends(admin_ctx)):
+        """Read-only. Mutual-check results phones recorded on each other. Evidence for review; nobody is suspended by these."""
+        db = ctx.db
+        users = {u.id: u for u in db.scalars(select(User))}
+        rows = db.scalars(select(CrossReport).order_by(CrossReport.id.desc()).limit(300)).all()
+        return {"reports": [{"id": r.id, "at": iso(r.created_at), "reporter": users[r.reporter_id].name, "subject_phone": r.subject_phone,
+                             "subject": users[r.subject_id].name if r.subject_id in users else None, "result": r.result, "codes": r.codes} for r in rows]}
+
+    if portal != "all":
+        always = {"/health", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+        want_admin = portal == "admin"
+        app.router.routes = [r for r in app.router.routes
+                             if not hasattr(r, "path") or r.path in always or r.path.startswith("/admin") == want_admin]
     return app
 
 
-def create_site_app() -> FastAPI:
-    """API under /api plus the built web app (../dist) at /, so one HTTPS tunnel serves a phone completely."""
+def create_site_app(portal: str = "user") -> FastAPI:
+    """One portal = one website: its API under /api plus its own built web app (dist/user or dist/admin) at /."""
     from pathlib import Path
     from fastapi.staticfiles import StaticFiles
     from starlette.responses import FileResponse
 
-    site = FastAPI(title="NiPay site")
-    site.mount("/api", create_app())
-    dist = Path(__file__).resolve().parent.parent.parent / "dist"
+    site = FastAPI(title=f"NiPay {portal} site")
+    site.mount("/api", create_app(portal=portal))
+    dist = Path(__file__).resolve().parent.parent.parent / "dist" / portal
     if dist.exists():
         class SPA(StaticFiles):
             async def get_response(self, path, scope):

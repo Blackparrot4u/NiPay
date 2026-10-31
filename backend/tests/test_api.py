@@ -385,3 +385,66 @@ def test_live_ledger_changes_only_at_sync(env):
     a.sync([{**e, "role": "sent"}])   # sync: now the server moves it
     s1 = snap()
     assert s1["a"]["send_slot"] == 9 and s1["b"]["receive_slot"] == 1 and s1["last_entry_id"] > s0["last_entry_id"]
+
+
+# ---- mutual checks: signed cross-reports ----
+def xr(phone, subject, result="pass", codes=(), ri="1", key=None, nonce="n1", subject_pk="pk"):
+    r = {"subject": subject.phone, "subject_pk": subject_pk, "ts": 1760000000000, "result": result, "codes": list(codes), "nonce": nonce, "ri": ri}
+    from nipay.service import Svc
+    r["sig"] = b64((key or phone.key).sign(Svc.cross_text(r, phone.phone).encode()).signature)
+    return r
+
+
+def test_trust_certificate_is_bound_to_device_and_carries_limit_and_expiry(env):
+    import json
+    a, b = pair(env)
+    doc = env.c.get("/trust/certificate", headers=a.h()).json()
+    blob = json.loads(unb64(doc["blob"]))
+    assert accept_rules(env.svc.bank.public, unb64(doc["blob"]), unb64(doc["sig"]))
+    assert blob["u"] == a.phone and blob["d"] == a.pub and blob["ls"] == 2000 and blob["lr"] == 10000 and blob["x"] > 1_700_000_000
+
+
+def test_cross_report_accepted_logged_and_never_suspends(env):
+    a, b = pair(env)
+    out = a.sync(cross_reports=[xr(a, b, "fail", ["cert_expired", "flagged"]), xr(a, b, "pass", nonce="n2")])["cross_reports"]
+    assert out["accepted"] == 2 and out["rejected"] == 0
+    assert len(events(env, "cross_check_fail")) == 1
+    assert b.wallet()["offline_suspended"] is False
+    with env.app.state.SessionLocal() as db:
+        assert db.scalars(select(ReviewItem).where(ReviewItem.type == "PEER_REPORT")).first() is not None
+        assert db.scalars(select(User).where(User.phone == b.phone)).first().offline_suspended is False
+    # a failed cross-report does not lower the subject's trust score (it is evidence for review, not a penalty)
+    assert env.c.get("/trust/certificate", headers=b.h()).json()["score"] == 500
+    # a replay of the same signed report is a duplicate, not a second log line
+    rp = xr(a, b, "fail", ["x"], nonce="n3")
+    a.sync(cross_reports=[rp]); assert a.sync(cross_reports=[rp])["cross_reports"]["duplicate"] == 1
+
+
+def test_cross_report_rejected_when_reporter_integrity_fails_or_signature_bad(env):
+    a, b = pair(env)
+    # reporter says its own integrity check failed
+    assert a.sync(cross_reports=[xr(a, b, "fail", ["x"], ri="0")])["cross_reports"]["rejected"] == 1
+    # signed by some other key, i.e. not the reporter's registered device
+    assert a.sync(cross_reports=[xr(a, b, "fail", ["x"], key=SigningKey.generate(), nonce="n9")])["cross_reports"]["rejected"] == 1
+    # reporter's wallet audit fails in the same sync (foreign ID in wallet): refused too
+    bad_wallet = {"points": [p["pid"] for p in a.points] + ["a" * 20], "mines": [], "seq": 0, "counter": 0, "month": a.points[0]["month"]}
+    assert a.sync(wallet=bad_wallet, cross_reports=[xr(a, b, "fail", ["x"], nonce="n8")])["cross_reports"]["rejected"] == 1
+    assert len(events(env, "cross_report_rejected")) == 3 and not events(env, "cross_check_fail")
+    assert b.wallet()["offline_suspended"] is False
+
+
+def test_two_portals_are_separate_apps(env):
+    user = TestClient(create_app(env.st, portal="user")); admin = TestClient(create_app(env.st, portal="admin"))
+    assert user.get("/admin/overview").status_code == 404 and user.post("/admin/login", json={"username": "admin", "password": "x"}).status_code == 404
+    assert admin.get("/wallet").status_code == 404 and admin.post("/auth/login", json={}).status_code == 404
+    a, b = pair(env)
+    pw = env.secrets["admins"]["admin"]
+    tok = admin.post("/admin/login", json={"username": "admin", "password": pw}).json()["token"]
+    assert admin.get("/admin/overview", headers={"Authorization": "Bearer " + tok}).status_code == 200
+    assert admin.get("/admin/overview", headers=a.h()).status_code == 403            # a phone token is not an admin token
+    assert user.get("/wallet", headers={"Authorization": "Bearer " + tok}).status_code == 403   # an admin token is not a phone token
+    assert admin.get("/admin/cross-reports", headers={"Authorization": "Bearer " + tok}).status_code == 200
+    # each site allows only its own origin
+    assert user.options("/wallet", headers={"Origin": "http://localhost:8001", "Access-Control-Request-Method": "GET"}).headers.get("access-control-allow-origin") is None
+    assert admin.options("/admin/overview", headers={"Origin": "http://localhost:8000", "Access-Control-Request-Method": "GET"}).headers.get("access-control-allow-origin") is None
+    assert admin.options("/admin/overview", headers={"Origin": "http://localhost:8001", "Access-Control-Request-Method": "GET"}).headers.get("access-control-allow-origin") == "http://localhost:8001"

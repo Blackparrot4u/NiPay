@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from .config import Settings
 from .core.idsystem import Bank, make_id, sign_handover, verify_handover, verify_receipt, verify_sig
 from .core.wallet import Wallet, HardwareCounter, audit_mines, mine_recipe, rules_blob, sign_rules, sign_trust
-from .models import (AuditLog, Device, LedgerEntry, Notice, Point, ReviewItem, SecurityEvent, Setting,
+from .models import (AuditLog, CrossReport, Device, LedgerEntry, Notice, Point, ReviewItem, SecurityEvent, Setting,
                      SettlementBatch, Transfer, User, now)
 
 
@@ -329,16 +329,65 @@ class Svc:
         paid = db.scalar(select(func.count()).select_from(Transfer).where(
             Transfer.status == "paid", Transfer.settled_at >= since, (Transfer.from_user_id == user.id) | (Transfer.to_user_id == user.id)))
         bad = db.scalar(select(func.count()).select_from(SecurityEvent).where(
-            SecurityEvent.user_id == user.id, SecurityEvent.created_at >= since, SecurityEvent.type != "lost_phone_claim"))
+            SecurityEvent.user_id == user.id, SecurityEvent.created_at >= since, SecurityEvent.type.notin_(("lost_phone_claim", "cross_check_fail", "cross_report_rejected"))))
         held = db.scalar(select(func.count()).select_from(Transfer).where(
             Transfer.status == "held", Transfer.from_user_id == user.id, Transfer.settled_at >= since))
         score = 500 + min(120, age * 120 // 180) + min(100, paid * 5) - min(300, bad * 60) - min(200, held * 200)
         return max(300, min(850, score)), age
 
-    def trust_doc(self, db, user: User) -> dict:
+    CERT_DAYS = 40
+
+    def trust_doc(self, db, user: User, device: Device | None = None) -> dict:
+        """The signed certificate a phone shows to another phone: trust, limits, expiry, bound to the device key."""
         score, age = self.trust(db, user)
-        blob, sig = sign_trust(self.bank, user.phone, score, age, self.current_month(db))
+        extra = {"ls": self.s.send_limit, "lr": self.s.receive_limit, "x": int((now() + timedelta(days=self.CERT_DAYS)).timestamp())}
+        if device is not None:
+            extra["d"] = device.public_key
+        blob, sig = sign_trust(self.bank, user.phone, score, age, self.current_month(db), extra)
         return {"score": score, "age_days": age, "window_days": 183, "blob": b64(blob), "sig": b64(sig)}
+
+    # ---------- cross-reports (phone checks phone) ----------
+    @staticmethod
+    def cross_text(r: dict, reporter_phone: str) -> str:
+        return "xr1|" + "|".join([reporter_phone, str(r.get("subject", "")), str(r.get("subject_pk", "")), str(r.get("ts", "")), str(r.get("result", "")),
+                                  ",".join(r.get("codes", [])), str(r.get("nonce", "")), str(r.get("ri", ""))])
+
+    def ingest_cross_reports(self, db, user: User, device: Device, reports: list, wallet_problems: list) -> dict:
+        """Evidence only: stored, logged, queued for human review. Nothing here suspends or blocks anyone.
+        A report from a reporter whose own integrity check fails is refused and logged against the reporter."""
+        out = {"accepted": 0, "rejected": 0, "duplicate": 0}
+        for r in reports[:100]:
+            if not isinstance(r, dict):
+                continue
+            sig = str(r.get("sig", ""))
+            if not sig or db.scalars(select(CrossReport).where(CrossReport.sig == sig)).first():
+                out["duplicate"] += 1
+                continue
+            why = ""
+            try:
+                VerifyKey(unb64(device.public_key)).verify(self.cross_text(r, user.phone).encode(), unb64(sig))
+            except Exception:
+                why = "bad_signature"
+            if not why and (r.get("result") not in ("pass", "fail") or not isinstance(r.get("codes", []), list)):
+                why = "malformed"
+            if not why and str(r.get("subject", "")) == user.phone:
+                why = "self_report"
+            if not why and (str(r.get("ri", "")) != "1" or wallet_problems or not device.active):
+                why = "reporter_integrity_failed"
+            if why:
+                out["rejected"] += 1
+                self.event(db, "cross_report_rejected", "MEDIUM", user.id, "", f"cross-report refused ({why}) about {str(r.get('subject', ''))[:15]}", source="phone")
+                continue
+            subj = db.scalars(select(User).where(User.phone == str(r["subject"]))).first()
+            codes = ",".join(str(c)[:20] for c in r.get("codes", []))[:200]
+            db.add(CrossReport(reporter_id=user.id, subject_phone=str(r["subject"])[:20], subject_id=subj.id if subj else None, result=r["result"], codes=codes,
+                               ts=int(r.get("ts", 0) or 0), nonce=str(r.get("nonce", ""))[:40], sig=sig))
+            if r["result"] == "fail":
+                self.event(db, "cross_check_fail", "MEDIUM", subj.id if subj else None, "", f"{user.phone} reports failed mutual check [{codes}] at connection (log only)", source="phone")
+                if subj:
+                    db.add(ReviewItem(type="PEER_REPORT", user_id=subj.id, summary=f"mutual check failed [{codes}], reported by {user.phone}"))
+            out["accepted"] += 1
+        return out
 
     # ---------- flow map ----------
     def flow_map(self, db) -> dict:

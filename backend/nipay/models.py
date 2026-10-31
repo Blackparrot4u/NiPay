@@ -208,3 +208,18 @@ class SettlementBatch(Base):
     status: Mapped[str] = mapped_column(String(10), default="OPEN")
     opened_at: Mapped[datetime] = mapped_column(UTCDateTime, default=now)
     settled_at: Mapped[datetime | None] = mapped_column(UTCDateTime, nullable=True)
+
+
+class CrossReport(Base):
+    """Signed result of one phone checking another at connection. Evidence for logs and review only: it never suspends anybody."""
+    __tablename__ = "cross_reports"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    reporter_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    subject_phone: Mapped[str] = mapped_column(String(20), index=True)
+    subject_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    result: Mapped[str] = mapped_column(String(8))  # pass | fail
+    codes: Mapped[str] = mapped_column(String(200), default="")
+    ts: Mapped[int] = mapped_column(BigInteger, default=0)
+    nonce: Mapped[str] = mapped_column(String(40), default="")
+    sig: Mapped[str] = mapped_column(String(100), unique=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=now)

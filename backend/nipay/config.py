@@ -27,7 +27,9 @@ class Settings:
     simultaneous_alert: int = 10  # claimants on one point that raise an alert
     test_funds: int = 50000  # fake money given at sign-up
     otp: str = os.environ.get("NIPAY_DEMO_OTP", "123456")  # MOCK: no SMS is sent
-    cors_origins: tuple = ("http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173")
+    # each website has its own origin and its own list: the user site never allows the admin origin, and the reverse
+    cors_origins: tuple = ("http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "http://127.0.0.1:8000")
+    admin_cors_origins: tuple = ("http://localhost:3001", "http://127.0.0.1:3001", "http://localhost:8001", "http://127.0.0.1:8001")
 
     def __post_init__(self):
         self.data_dir = Path(self.data_dir)
