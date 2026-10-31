@@ -11,4 +11,4 @@ if __name__ == "__main__":
     print(f"  database: {st.database_url}")
     print(f"  demo OTP (mock, no SMS): {st.otp}")
     print("  admin logins (from gitignored backend/data/secrets.json): " + ", ".join(sec["admins"].keys()))
-    uvicorn.run("nipay.main:create_app", factory=True, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")))
+    uvicorn.run("nipay.main:create_site_app", factory=True, host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8000")))

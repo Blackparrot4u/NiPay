@@ -317,7 +317,7 @@ def test_admin_read_endpoints_and_roles_and_audit_chain(env):
     a, b = pair(env)
     b.claim(a.pay_to(b, a.value_points()[0]))
     h = admin(env)
-    for p in ("overview", "live", "users", "security-logs", "same-id", "review", "appeals", "flow-map", "rules", "ledger", "analytics", "audit-log"):
+    for p in ("overview", "live", "live-ledger", "users", "security-logs", "same-id", "review", "appeals", "flow-map", "rules", "ledger", "analytics", "audit-log"):
         assert env.c.get(f"/admin/{p}", headers=h).status_code == 200, p
     assert env.c.get("/admin/overview", headers=a.h()).status_code == 403   # a user token is not an admin token
     assert env.c.get("/admin/overview").status_code == 401
@@ -371,3 +371,17 @@ def test_secrets_are_generated_and_not_in_repo_files(env):
     import json
     s = json.load(open(env.dir + "/secrets.json"))
     assert len(base64.b64decode(s["signing_key"])) == 32 and len(base64.b64decode(s["seed"])) == 32
+
+
+def test_live_ledger_changes_only_at_sync(env):
+    a, b = pair(env, 10)
+    h = admin(env)
+    snap = lambda: env.c.get("/admin/live-ledger", headers=h).json()
+    s0 = snap()
+    assert s0["a"]["send_slot"] == 10 and "TEST MONEY" in s0["label"]
+    # an offline payment: phones sign and exchange data, but nothing reaches the server
+    e = a.pay_to(b, a.value_points()[0])
+    assert snap()["a"] == s0["a"] and snap()["b"] == s0["b"] and snap()["last_entry_id"] == s0["last_entry_id"]
+    a.sync([{**e, "role": "sent"}])   # sync: now the server moves it
+    s1 = snap()
+    assert s1["a"]["send_slot"] == 9 and s1["b"]["receive_slot"] == 1 and s1["last_entry_id"] > s0["last_entry_id"]

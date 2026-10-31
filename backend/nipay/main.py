@@ -658,6 +658,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.commit()
         return {"batch": b.id, "transfers": n}
 
+    @app.get("/admin/live-ledger")
+    def a_live_ledger(a: str = "", b: str = "", ctx: Ctx = Depends(admin_ctx)):
+        """Projector page data: test money only. Balances come straight from the server ledger,
+        so they change only when a sync or top-up reaches the server, never during an offline payment."""
+        db = ctx.db
+        users = db.scalars(select(User).order_by(User.id)).all()
+        pick = lambda ph, i: next((u for u in users if u.phone == ph), users[i] if len(users) > i else None)
+        ua, ub = pick(a, 0), pick(b, 1)
+        if ub is not None and ua is not None and ub.id == ua.id:
+            ub = next((u for u in users if u.id != ua.id), None)
+        view = lambda u: None if u is None else {"id": u.id, "name": u.name, "phone": u.phone, "account": u.main_balance, "send_slot": u.send_bucket, "receive_slot": u.receive_bucket}
+        ids = [u.id for u in (ua, ub) if u]
+        rows = db.scalars(select(LedgerEntry).where((LedgerEntry.user_id.in_(ids)) | (LedgerEntry.other_user_id.in_(ids))).order_by(LedgerEntry.id.desc()).limit(12)).all() if ids else []
+        names = {u.id: u.name for u in users}
+        return {"label": "TEST MONEY - fake rupees, no real payment gateway", "a": view(ua), "b": view(ub), "users": [{"phone": u.phone, "name": u.name} for u in users],
+                "server_time": now().isoformat(), "last_entry_id": rows[0].id if rows else 0,
+                "entries": [{"id": r.id, "at": r.ts.isoformat(), "kind": r.kind, "who": names.get(r.user_id), "other": names.get(r.other_user_id),
+                             "d_main": r.d_main, "d_send": r.d_send, "d_recv": r.d_recv} for r in rows]}
+
     @app.get("/admin/analytics")
     def a_analytics(ctx: Ctx = Depends(admin_ctx)):
         db = ctx.db
@@ -683,3 +702,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "entries": [{"id": r.id, "at": iso(r.ts), "actor": r.actor, "role": r.role, "action": r.action, "target": r.target, "ip": r.ip} for r in rows]}
 
     return app
+
+
+def create_site_app() -> FastAPI:
+    """API under /api plus the built web app (../dist) at /, so one HTTPS tunnel serves a phone completely."""
+    from pathlib import Path
+    from fastapi.staticfiles import StaticFiles
+    from starlette.responses import FileResponse
+
+    site = FastAPI(title="NiPay site")
+    site.mount("/api", create_app())
+    dist = Path(__file__).resolve().parent.parent.parent / "dist"
+    if dist.exists():
+        class SPA(StaticFiles):
+            async def get_response(self, path, scope):
+                resp = await super().get_response(path, scope)
+                if resp.status_code == 404:
+                    return FileResponse(dist / "index.html")
+                # the service worker file must never be cached by the browser's HTTP cache
+                if path in ("sw.js", "index.html", ""):
+                    resp.headers["Cache-Control"] = "no-cache"
+                return resp
+        site.mount("/", SPA(directory=dist, html=True))
+    return site
