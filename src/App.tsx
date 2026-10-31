@@ -1,53 +1,141 @@
-import { useEffect, useState } from 'react';
-import { useDevice, syncNow, slotName } from './lib/device';
-import { Welcome, Signup, Login } from './screens/Auth';
-import { Home, TopUp, Move, History, More, useOnline } from './screens/Main';
-import { Pay } from './screens/Pay';
-import { Receive } from './screens/Receive';
-import { Inspect } from './screens/Inspect';
-import { Selfie } from './screens/Selfie';
-import { Badge } from './ui';
+import React from 'react';
+import { OfflinePaymentProvider, useOfflinePayment } from './context/OfflinePaymentContext';
+import { NiPayHeader } from './components/layout/NiPayHeader';
+import { UserSidebarNav } from './components/user/UserSidebarNav';
+import { UserWalletHub } from './components/user/UserWalletHub';
+import { UserPayConnect } from './components/user/UserPayConnect';
+import { UserReceive } from './components/user/UserReceive';
+import { UserTopUp } from './components/user/UserTopUp';
+import { UserMoveMoney } from './components/user/UserMoveMoney';
+import { UserMineInspector } from './components/user/UserMineInspector';
+import { UserHistory } from './components/user/UserHistory';
+import { UserKyc } from './components/user/UserKyc';
+import { UserDisputes } from './components/user/UserDisputes';
+import { AdminDashboard } from './components/admin/AdminDashboard';
+import {
+  LayoutDashboard,
+  ArrowUpRight,
+  ArrowDownLeft,
+  History,
+  ShieldCheck,
+  PlusCircle
+} from 'lucide-react';
 
-const useRoute = () => {
-  const [r, setR] = useState(location.hash.slice(1) || '/');
-  useEffect(() => { const f = () => setR(location.hash.slice(1) || '/'); addEventListener('hashchange', f); return () => removeEventListener('hashchange', f); }, []);
-  return r;
-};
+const MainAppContent: React.FC = () => {
+  const { currentRole, currentRoute, navigateTo } = useOfflinePayment();
 
-export default function App() {
-  const route = useRoute(); const d = useDevice(); const online = useOnline();
-  // any internet contact forces a ping: sync as soon as we are online and signed in
-  useEffect(() => { if (online && d.token) syncNow(); }, [online, d.token]);
-  const signedIn = !!d.token;
-  let view;
-  if (!signedIn && !['/signup', '/login'].includes(route)) view = <Welcome />;
-  else switch (route) {
-    case '/signup': view = <Signup />; break;
-    case '/login': view = <Login />; break;
-    case '/topup': view = <TopUp />; break;
-    case '/pay': view = <Pay />; break;
-    case '/receive': view = <Receive />; break;
-    case '/history': view = <History />; break;
-    case '/move': view = <Move />; break;
-    case '/more': view = <More />; break;
-    case '/selfie': view = <Selfie />; break;
-    case '/inspect': view = <Inspect />; break;
-    default: view = <Home />;
-  }
+  // Route router for user portal
+  const renderUserScreen = () => {
+    switch (currentRoute) {
+      case '/user/pay-connect':
+        return <UserPayConnect />;
+      case '/user/receive':
+        return <UserReceive />;
+      case '/user/topup':
+        return <UserTopUp />;
+      case '/user/move-money':
+        return <UserMoveMoney />;
+      case '/user/mine-inspector':
+        return <UserMineInspector />;
+      case '/user/history':
+        return <UserHistory />;
+      case '/user/signup':
+      case '/user/settings':
+        return <UserKyc />;
+      case '/user/report-appeal':
+        return <UserDisputes />;
+      case '/user/home':
+      default:
+        return <UserWalletHub />;
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <div className="mx-auto max-w-md px-4 pb-24 pt-4">
-        {slotName !== 'main' && <div className="mb-2"><Badge tone="blue">test slot: {slotName}</Badge></div>}
-        {view}
-        <p className="mt-8 text-center text-[11px] text-slate-400">Prototype · fake money · test data only · web demo (see More for what is real)</p>
-      </div>
-      {signedIn && (
-        <nav className="fixed bottom-0 inset-x-0 border-t bg-white">
-          <div className="mx-auto max-w-md grid grid-cols-5 text-center text-xs">
-            {[['/', 'Home'], ['/pay', 'Pay'], ['/receive', 'Receive'], ['/history', 'History'], ['/more', 'More']].map(([p, l]) => <a key={p} href={`#${p}`} className={`py-3 ${route === p ? 'font-bold text-slate-900' : 'text-slate-500'}`}>{l}</a>)}
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans antialiased selection:bg-blue-100 selection:text-blue-900">
+      {/* Top Header */}
+      <NiPayHeader />
+
+      {/* Main Body */}
+      {currentRole === 'admin' ? (
+        <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 pb-20">
+          <AdminDashboard />
+        </main>
+      ) : (
+        <div className="flex-1 max-w-7xl w-full mx-auto flex">
+          {/* Left Desktop Sidebar Nav */}
+          <UserSidebarNav />
+
+          {/* User Screen Content */}
+          <main className="flex-1 p-4 sm:p-6 pb-24 md:pb-12 max-w-5xl overflow-y-auto">
+            {renderUserScreen()}
+          </main>
+        </div>
+      )}
+
+      {/* Mobile Bottom Navigation (User Role Only) */}
+      {currentRole === 'user' && (
+        <nav className="md:hidden fixed bottom-0 inset-x-0 bg-white border-t border-slate-200 z-30 shadow-lg">
+          <div className="grid grid-cols-5 text-center text-[10px] font-semibold py-1">
+            <button
+              onClick={() => navigateTo('/user/home')}
+              className={`py-2 flex flex-col items-center gap-1 cursor-pointer ${
+                currentRoute === '/user/home' ? 'text-blue-600' : 'text-slate-500'
+              }`}
+            >
+              <LayoutDashboard className="w-4 h-4" />
+              <span>Hub</span>
+            </button>
+
+            <button
+              onClick={() => navigateTo('/user/pay-connect')}
+              className={`py-2 flex flex-col items-center gap-1 cursor-pointer ${
+                currentRoute === '/user/pay-connect' ? 'text-blue-600' : 'text-slate-500'
+              }`}
+            >
+              <ArrowUpRight className="w-4 h-4" />
+              <span>Pay</span>
+            </button>
+
+            <button
+              onClick={() => navigateTo('/user/receive')}
+              className={`py-2 flex flex-col items-center gap-1 cursor-pointer ${
+                currentRoute === '/user/receive' ? 'text-blue-600' : 'text-slate-500'
+              }`}
+            >
+              <ArrowDownLeft className="w-4 h-4" />
+              <span>Receive</span>
+            </button>
+
+            <button
+              onClick={() => navigateTo('/user/topup')}
+              className={`py-2 flex flex-col items-center gap-1 cursor-pointer ${
+                currentRoute === '/user/topup' ? 'text-blue-600' : 'text-slate-500'
+              }`}
+            >
+              <PlusCircle className="w-4 h-4" />
+              <span>Top-up</span>
+            </button>
+
+            <button
+              onClick={() => navigateTo('/user/history')}
+              className={`py-2 flex flex-col items-center gap-1 cursor-pointer ${
+                currentRoute === '/user/history' ? 'text-blue-600' : 'text-slate-500'
+              }`}
+            >
+              <History className="w-4 h-4" />
+              <span>History</span>
+            </button>
           </div>
         </nav>
       )}
     </div>
+  );
+};
+
+export default function App() {
+  return (
+    <OfflinePaymentProvider>
+      <MainAppContent />
+    </OfflinePaymentProvider>
   );
 }
