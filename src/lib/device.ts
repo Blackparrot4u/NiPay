@@ -7,6 +7,7 @@ import {
   signHandover, signReceipt, verifyReceipt, auditMines,
 } from './idsystem';
 import { api, ApiError, NetworkError } from './api';
+import { Cert, CheckOutcome, CrossReport, PeerCard, checkPeer, makeCard, signReport } from './peercheck';
 
 export interface StoredPoint { pid: string; month: string; sig: string; kind: 'value' | 'control' }
 export interface Held { pid: string; month: string; sig: string; handover: string; receipt: string; peer: string; peerName: string; ref: string; ts: number; synced: boolean; status?: string; transport: string }
@@ -21,11 +22,12 @@ export interface State {
   queuedReports: { type: string; pid: string; description: string }[];
   server: any | null; history: any[]; lastSync: string | null; lastSyncOk: boolean;
   trace: string[]; locked: boolean;
+  cert: Cert | null; crossReports: CrossReport[]; passkeyId: string | null; selfieDone: boolean;
 }
 const empty = (): State => {
   const kp = newKeypair();
   return { seed: b64(kp.seed), pub: b64(kp.pub), token: null, phone: '', name: '', pinHash: '', pinSalt: '', language: 'en', bankPub: '', docs: [], notices: [], trust: null,
-    points: [], inflight: [], mines: [], seq: 0, received: [], sent: [], queuedReports: [], server: null, history: [], lastSync: null, lastSyncOk: false, trace: [], locked: false };
+    points: [], inflight: [], mines: [], seq: 0, received: [], sent: [], queuedReports: [], server: null, history: [], lastSync: null, lastSyncOk: false, trace: [], locked: false, cert: null, crossReports: [], passkeyId: null, selfieDone: false };
 };
 
 const slot = (typeof location !== 'undefined' && new URLSearchParams(location.search).get('slot')) || 'main';
@@ -71,10 +73,10 @@ export function recipeFor(month: string): Recipe | null {
   const blob = d && acceptSigned(bankPubBytes(), d.mine);
   return blob ? parseRecipe(blob) : null;
 }
-export function policy(month: string): { send: number; recv: number; grace: number } {
+export function policy(month: string): { send: number; recv: number; grace: number } | null {
   const d = state.docs.find((x) => x.month === month);
   const blob = d && acceptSigned(bankPubBytes(), d.policy);
-  return blob ? JSON.parse(new TextDecoder().decode(blob)) : { send: 2000, recv: 10000, grace: 38 };
+  return blob ? JSON.parse(new TextDecoder().decode(blob)) : null;
 }
 /** Accepts a rules package only if the bank signed all of it. Used for sync AND for phone-to-phone passing. */
 export function acceptRulesDoc(doc: Docs): boolean {
@@ -110,6 +112,15 @@ export function addTopupPoints(points: StoredPoint[]) {
 }
 
 /** Picks points in KT's spend order, locks them as in flight, and signs the handover to `to`. */
+/** Restore detection before anything is sent: the wallet sequence must equal the (simulated) hardware counter. Locks the wallet if not. */
+export function walletUsable(): boolean {
+  if (state.locked || state.seq !== hwCounter()) {
+    if (!state.locked) queueReport('restore', '', 'wallet sequence behind the hardware counter: wallet was restored from a copy');
+    set({ locked: true });
+    return false;
+  }
+  return true;
+}
 export function prepareSpend(n: number, to: string, month: string): { pid: string; month: string; sig: Uint8Array; handover: Uint8Array }[] {
   const s = state;
   // restore detection: the wallet sequence must equal the (simulated) hardware counter
@@ -164,7 +175,7 @@ export const layerToTripwire = (l: string) => ({ B: 'tower', A: 'landmine', H: '
 // ---------- sync ----------
 export interface SyncResult { ok: boolean; offline?: boolean; message: string; results?: any[] }
 let syncing = false;
-export async function syncNow(): Promise<SyncResult> {
+export async function syncNow(round = 0): Promise<SyncResult> {
   const s0 = state;
   if (!s0.token || syncing) return { ok: false, message: 'not signed in' };
   syncing = true;
@@ -174,8 +185,9 @@ export async function syncNow(): Promise<SyncResult> {
       ...s0.received.filter((x) => !x.synced).map((x) => ({ role: 'received', month: x.month, pid: x.pid, sig: x.sig, handover: x.handover, payment_ref: x.ref, transport: x.transport, ts: new Date(x.ts).toISOString() })),
     ];
     const month = currentMonth();
-    const wallet = { points: s0.points.map((p) => p.pid), mines: s0.mines, seq: s0.seq, counter: hwCounter(), month, control: controlKey() || undefined };
-    const r = await api('/sync', { body: { logs, reports: s0.queuedReports, wallet, client_time: new Date().toISOString() }, token: s0.token });
+    const wallet = { points: s0.points.map((p) => p.pid), mines: s0.mines, seq: s0.seq, counter: hwCounter(), month, control: controlKey() || undefined, counter_kind: 'simulated-browser' };   // a browser has no hardware counter: weak, labelled so
+    const sentReports = s0.crossReports;
+    const r = await api('/sync', { body: { logs, reports: s0.queuedReports, cross_reports: sentReports, wallet, client_time: new Date().toISOString() }, token: s0.token });
     // adopt bank-signed documents only if the signatures are good
     let rejectedDocs = 0;
     for (const d of [r.rules]) if (!acceptRulesDoc(d)) rejectedDocs++;
@@ -184,12 +196,13 @@ export async function syncNow(): Promise<SyncResult> {
     const byPid = new Map(results.map((x) => [x.pid, x]));
     const mark = (list: Held[]) => list.map((x) => { const res = byPid.get(x.pid); return res && res.status !== 'pending' ? { ...x, synced: true, status: res.status } : res && res.status === 'pending' ? { ...x, status: 'pending' } : x; });
     set((s) => ({
-      sent: mark(s.sent), received: mark(s.received), queuedReports: [], notices: nb ? JSON.parse(new TextDecoder().decode(nb)).bad : s.notices,
-      trust: { score: r.trust.score, age_days: r.trust.age_days }, server: r.wallet, lastSync: new Date().toISOString(), lastSyncOk: true,
+      sent: mark(s.sent), received: mark(s.received), queuedReports: [], crossReports: s.crossReports.filter((x) => !sentReports.includes(x)), notices: nb ? JSON.parse(new TextDecoder().decode(nb)).bad : s.notices,
+      trust: { score: r.trust.score, age_days: r.trust.age_days }, cert: { blob: r.trust.blob, sig: r.trust.sig }, server: r.wallet, lastSync: new Date().toISOString(), lastSyncOk: true,
     }));
     // points that settled as paid are bank-side now; remove synced received entries older than the list cap
     const hist = await api('/history', { token: s0.token }).catch(() => null);
     if (hist) set({ history: hist.payments });
+    if (r.more && round < 10) { syncing = false; return syncNow(round + 1); }   // the server takes a batch per round; send the rest
     trace(`sync ok: ${logs.length} log lines, ${results.filter((x) => x.status === 'paid').length} paid, ${results.filter((x) => x.status === 'held').length} held${rejectedDocs ? ', REJECTED unsigned rules' : ''}`);
     return { ok: true, message: 'Synced', results };
   } catch (e) {
@@ -210,4 +223,24 @@ export { signReceipt, verifyReceipt, auditMines, ALPHA };
 export function matchCode(ref: string, nonce: string): string {
   return String(sha256b(enc.encode(ref + '|' + nonce))[0] % 100).padStart(2, '0');
 }
-export const MAX_QR_POINTS = 60; // 148 bytes/point over animated QR: more than this is too slow to scan
+/** One payment over the encrypted link: up to the whole send bucket. */
+export const MAX_PAYMENT = 2000;
+
+// ---------- mutual check at connection ----------
+/** Own integrity signal as far as a browser can give one: wallet not locked and sequence equals the (simulated) counter. Play Integrity / App Attest are native-app only. */
+export const ownIntegrity = () => (!state.locked && state.seq === hwCounter() ? '1' : '0');
+/** The card this phone shows to the other phone: identity, bank-signed certificate, rules month, integrity signal, device signature. */
+export const ownCard = (nonce: string): PeerCard =>
+  makeCard(unb64(state.seed), { phone: state.phone, name: state.name, pk: state.pub, kyc: true, nonce, cert: state.cert, month: currentMonth(), integ: ownIntegrity() });
+export const peerCtx = () => ({ bankPub: bankPubBytes(), now: Date.now(), acceptableMonths: acceptableMonths(), flagged: blocklist() });
+/** Checks the other phone's card and stores a signed cross-report of the result. Returns the outcome; the caller decides what the user sees. */
+export function mutualCheck(card: PeerCard | undefined | null): CheckOutcome {
+  const out = checkPeer(card, peerCtx());
+  recordCross(card, out.codes);
+  return out;
+}
+export function recordCross(card: PeerCard | undefined | null, codes: string[]) {
+  if (!card?.phone) return;
+  const r = signReport(unb64(state.seed), state.phone, { subject: card.phone, subject_pk: card.pk ?? '', ts: Date.now(), result: codes.length ? 'fail' : 'pass', codes, nonce: b64(randomBytes(6)), ri: ownIntegrity() });
+  set((s) => ({ crossReports: [...s.crossReports, r].slice(-100) }));
+}

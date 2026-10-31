@@ -177,9 +177,10 @@ def audit_mines(w: "Wallet") -> dict:
     return {"whole": len(whole), "expected_at_least": expected, "fake": len(fake), "problems": problems}
 
 
-def sign_trust(bank: Bank, user: str, score: int, age_days: int, month: str) -> tuple:
-    """Trust is worked out at the bank and signed. The phone only carries it."""
-    blob = json.dumps({"u": user, "s": score, "a": age_days, "m": month}, separators=(",", ":")).encode()
+def sign_trust(bank: Bank, user: str, score: int, age_days: int, month: str, extra: dict | None = None) -> tuple:
+    """Trust is worked out at the bank and signed. The phone only carries it.
+    extra (certificate fields): d device public key, ls/lr send/receive limit, x expiry (unix seconds)."""
+    blob = json.dumps({"u": user, "s": score, "a": age_days, "m": month, **(extra or {})}, separators=(",", ":")).encode()
     return blob, bank.signing.sign(blob).signature
 
 

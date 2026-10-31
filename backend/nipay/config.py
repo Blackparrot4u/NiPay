@@ -22,12 +22,17 @@ class Settings:
     rate_limit_per_min: int = int(os.environ.get("NIPAY_RATE_LIMIT", "600"))
     login_rate_per_min: int = int(os.environ.get("NIPAY_LOGIN_RATE", "20"))
     grace_days: int = 38  # design: 35-40 days after month end
+    topup_fee: int = 1
     send_limit: int = 2000
+    weak_counter_send_limit: int = int(os.environ.get("NIPAY_WEAK_COUNTER_LIMIT", "2000"))  # limit for phones without a hardware counter (browser demo = weak)
+    sudden_change_min: int = 200  # a sync settling at least this many points AND 5x the usual opens a review item
     receive_limit: int = 10000
     simultaneous_alert: int = 10  # claimants on one point that raise an alert
     test_funds: int = 50000  # fake money given at sign-up
     otp: str = os.environ.get("NIPAY_DEMO_OTP", "123456")  # MOCK: no SMS is sent
-    cors_origins: tuple = ("http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:5173")
+    # each website has its own origin and its own list: the user site never allows the admin origin, and the reverse
+    cors_origins: tuple = ("http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "http://127.0.0.1:8000")
+    admin_cors_origins: tuple = ("http://localhost:3001", "http://127.0.0.1:3001", "http://localhost:8001", "http://127.0.0.1:8001")
 
     def __post_init__(self):
         self.data_dir = Path(self.data_dir)

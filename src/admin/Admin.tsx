@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
-import { Badge, Btn, Card, Err, Field, Notice, errText } from '../ui';
+import { Badge, Btn, Card, Err, Field, Notice, errText } from '../shared/atoms';
 
 const TK = 'nipay:admin:token';
 const useAdmin = () => {
@@ -40,7 +40,7 @@ export function Admin({ page }: { page: string }) {
     <div className="flex min-h-screen bg-slate-50">
       <nav className="w-52 shrink-0 border-r bg-white p-3 space-y-0.5 text-sm">
         <p className="font-bold px-2 pb-2">NiPay admin</p>
-        {PAGES.map(([k, l]) => <a key={k} href={`#/admin/${k}`} className={`block rounded px-2 py-1.5 ${page === k ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-100'}`}>{l}</a>)}
+        {PAGES.map(([k, l]) => <a key={k} href={`#/${k}`} className={`block rounded px-2 py-1.5 ${page === k ? 'bg-slate-900 text-white' : 'text-slate-700 hover:bg-slate-100'}`}>{l}</a>)}
         <p className="px-2 pt-4 text-xs text-slate-400">{a.who?.name} ({a.who?.role})</p><button className="px-2 text-xs underline" onClick={a.logout}>Sign out</button>
       </nav>
       <main className="flex-1 p-6 max-w-5xl space-y-4"><Page a={a} /></main>
@@ -72,9 +72,13 @@ function Users({ a }: P) {
 
 function Security({ a }: P) {
   const [d] = usePoll<any>(a.call, '/admin/security-logs', 4000);
+  const [x] = usePoll<any>(a.call, '/admin/cross-reports', 4000);
   return (<><h1 className="text-xl font-bold">Security logs</h1>
     <Notice tone="sky">Read-only. Tripwires fire on the phones with no server involved; this page only records what arrived at sync. Nothing here is resolved, fixed or closed by an admin.</Notice>
-    <Card><Table head={['Time', 'Type', 'Severity', 'Account', 'Region', 'Point', 'Detail']} rows={(d?.events ?? []).map((e: any) => [when(e.at), <b>{e.type}</b>, <Badge tone={tone(e.severity)}>{e.severity}</Badge>, e.user ?? '-', e.region ?? '-', <code className="text-xs">{e.pid ? e.pid.slice(0, 8) + '…' : ''}</code>, <span className="text-xs">{e.description}</span>])} /></Card></>);
+    <Card><Table head={['Time', 'Type', 'Severity', 'Account', 'Region', 'Point', 'Detail']} rows={(d?.events ?? []).map((e: any) => [when(e.at), <b>{e.type}</b>, <Badge tone={tone(e.severity)}>{e.severity}</Badge>, e.user ?? '-', e.region ?? '-', <code className="text-xs">{e.pid ? e.pid.slice(0, 8) + '…' : ''}</code>, <span className="text-xs">{e.description}</span>])} /></Card>
+    <h2 className="text-base font-bold mt-4">Mutual checks at connection (signed cross-reports)</h2>
+    <Notice tone="sky">Each phone checked the other when they connected and signed the result. These are evidence for the logs and the review queue. No report suspends or blocks anybody by itself.</Notice>
+    <Card><Table head={['Received', 'Checked by', 'Phone checked', 'Name', 'Result', 'Failed checks']} rows={(x?.reports ?? []).map((r: any) => [when(r.at), r.reporter, r.subject_phone, r.subject ?? '-', <Badge tone={r.result === 'fail' ? 'red' : 'green'}>{r.result}</Badge>, <span className="text-xs">{r.codes || '-'}</span>])} /></Card></>);
 }
 
 function SameId({ a }: P) {
@@ -167,7 +171,7 @@ function LiveLedger({ a }: P) {
       <div className="flex items-center justify-between"><h1 className="text-5xl font-bold">Live ledger</h1><span className="text-3xl font-bold bg-amber-100 text-amber-800 rounded-xl px-5 py-2">TEST MONEY - fake rupees</span></div>
       <div className="flex gap-3 items-center text-lg"><select className="border rounded p-1" value={pa} onChange={(e) => setPa(e.target.value)}><option value="">Person A: first user</option>{d?.users.map((u: any) => <option key={u.phone} value={u.phone}>{u.name}</option>)}</select>
         <select className="border rounded p-1" value={pb} onChange={(e) => setPb(e.target.value)}><option value="">Person B: second user</option>{d?.users.map((u: any) => <option key={u.phone} value={u.phone}>{u.name}</option>)}</select>
-        <a href="#/admin/overview" className="underline ml-auto text-sm">Back to dashboard</a></div>
+        <a href="#/overview" className="underline ml-auto text-sm">Back to dashboard</a></div>
       <div className="grid grid-cols-3 gap-6"><Big label={`${A?.name ?? 'A'}: account`} v={A?.account} sub="main account at the bank" /><Big label={`${A?.name ?? 'A'}: send slot`} v={A?.send_slot} sub="offline points not yet spent" /><Big label={`${B?.name ?? 'B'}: account`} v={B?.account} sub={`+ receive slot: ${B?.receive_slot ?? 0}`} /></div>
       <p className="text-2xl text-slate-500">These numbers change only when a phone syncs with the bank. While phones are offline and paying each other, they stay exactly as they are. Updated {d ? new Date(d.server_time).toLocaleTimeString() : '...'}</p>
       <div className="space-y-2">{d?.entries.map((e: any) => (<div key={e.id} className="bg-white border rounded-xl px-5 py-3 text-2xl flex justify-between animate-[fadein_.8s]"><span>{new Date(e.at).toLocaleTimeString()} · <b>{e.kind.replace(/_/g, ' ')}</b> · {e.who}{e.other ? ` → ${e.other}` : ''}</span><span className="text-slate-600">{[e.d_main && `account ${e.d_main > 0 ? '+' : ''}${e.d_main}`, e.d_send && `send ${e.d_send > 0 ? '+' : ''}${e.d_send}`, e.d_recv && `receive ${e.d_recv > 0 ? '+' : ''}${e.d_recv}`].filter(Boolean).join(', ')}</span></div>))}</div>

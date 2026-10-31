@@ -1,4 +1,5 @@
 """NiPay API. Fake money and test data only. See README for what is real and what is simulated."""
+import base64
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -13,11 +14,12 @@ from .config import ADMIN_USERS, Settings, load_secrets
 from .core.idsystem import verify_sig
 from .core.wallet import code_digest, choose_block
 from .db import Base, make_engine, make_session_factory
-from .models import (Appeal, AuditLog, Device, LedgerEntry, Notice, Point, Report, ReviewItem, SecurityEvent,
+from .models import (Appeal, AuditLog, CrossReport, Device, LedgerEntry, Notice, Point, Report, ReviewItem, SecurityEvent,
                      SettlementBatch, Session, Setting, Transfer, User, now)
 from .security import PinGuard, RateLimiter, check_pin, hash_pin, hash_token, new_token
 from .service import Rejected, Svc, b64, unb64
 
+SYNC_BATCH = 2500
 PHONE_RE = re.compile(r"^\+?[0-9]{10,13}$")
 TRIPWIRES = {"forged", "landmine", "tower", "code_check", "restore", "control_key_leak", "root"}
 BANKS = ("Demo Bank A", "Demo Bank B", "Demo Bank C")  # fictional; no real bank names or logos
@@ -60,6 +62,7 @@ class CancelIn(LoginIn):
 class TopupIn(BaseModel):
     amount: int
     pin: str
+    unsynced_spent: int = 0  # points this phone spent offline and has not synced yet
 
 
 class MoveIn(BaseModel):
@@ -70,6 +73,8 @@ class SyncIn(BaseModel):
     logs: list[dict] = []
     reports: list[dict] = []
     wallet: dict | None = None
+    cross_reports: list[dict] = []
+    code_digest: str = ""
     client_time: str = ""
 
 
@@ -87,6 +92,11 @@ class AppealIn(BaseModel):
     reason: str = Field(min_length=3)
     kind: str = "flag"
     documents: list[str] = []
+
+
+class SelfieIn(BaseModel):
+    image: str  # data URL (image/jpeg), taken with the camera at sign-up
+    consent: bool = False
 
 
 class IntegrityIn(BaseModel):
@@ -111,7 +121,8 @@ class SuspendIn(BaseModel):
     reason: str = Field(min_length=3)
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, portal: str = "all") -> FastAPI:
+    """portal 'user' serves only the phone API, 'admin' only /admin/*. 'all' (tests) serves both. Two separate servers in production."""
     st = settings or Settings()
     store = load_secrets(st.data_dir)
     svc = Svc(st, store)
@@ -123,7 +134,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="NiPay demo API", version="0.2")
     app.state.svc, app.state.SessionLocal, app.state.settings = svc, SessionLocal, st
-    app.add_middleware(CORSMiddleware, allow_origins=list(st.cors_origins), allow_credentials=False,
+    app.add_middleware(CORSMiddleware, allow_origins=list(st.admin_cors_origins if portal == "admin" else st.cors_origins), allow_credentials=False,
                        allow_methods=["*"], allow_headers=["*"])
 
     @app.middleware("http")
@@ -188,7 +199,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"id": u.id, "name": u.name, "phone": u.phone, "bank": u.bank, "region": u.region, "language": u.language,
                 "kyc_status": u.kyc_status, "kyc_note": "test data only; no real Aadhaar/PAN is stored",
                 "main_balance": u.main_balance, "send_bucket": u.send_bucket, "receive_bucket": u.receive_bucket,
-                "send_limit": st.send_limit, "receive_limit": st.receive_limit, "offline_suspended": u.offline_suspended,
+                "send_limit": svc.send_limit_for(db, dev), "receive_limit": st.receive_limit, "topup_fee": st.topup_fee, "offline_suspended": u.offline_suspended,
                 "suspend_reason": u.suspend_reason, "month": cur, "days_until_renewal": max(0, (nxt - datetime.now(timezone.utc)).days),
                 "grace_days": st.grace_days, "pending_transfers": pending,
                 "last_sync_at": u.last_sync_at.isoformat() if u.last_sync_at else None,
@@ -203,6 +214,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health")
     def health():
         return {"ok": True}
+
+    @app.get("/meta")
+    def meta():
+        """Choices the sign-up form shows, so the app carries no baked lists. The OTP is a labelled demo value (no SMS exists)."""
+        return {"banks": list(BANKS), "regions": ["Plains", "Hills", "Snow region"], "demo_otp": st.otp, "demo_otp_note": "MOCK: no SMS is sent in this demo; this fixed code works for everyone."}
 
     @app.get("/bank/public-key")
     def public_key():
@@ -316,12 +332,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not check_pin(body.pin, ctx.user.pin_hash):
             bad("bad_pin", 403)
         try:
-            pts = svc.topup(ctx.db, ctx.user, ctx.device, body.amount)
+            pts = svc.topup(ctx.db, ctx.user, ctx.device, body.amount, body.unsynced_spent)
         except Rejected as r:
             ctx.db.rollback()
             bad(r.code)
         ctx.db.commit()
-        return {"points": pts, "fee": 1, "wallet": wallet_view(ctx.db, ctx.user, ctx.device)}
+        return {"points": pts, "fee": st.topup_fee, "wallet": wallet_view(ctx.db, ctx.user, ctx.device)}
 
     @app.post("/wallet/move-to-main")
     def move_to_main(body: MoveIn, ctx: Ctx = Depends(user_ctx)):
@@ -336,7 +352,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # ---------- sync and claims ----------
     def run_logs(ctx: Ctx, logs: list) -> list:
         out = []
-        for e in logs[:500]:
+        for e in logs[:SYNC_BATCH]:
             role = "claimant" if e.get("role") in ("received", "claimant") else "sender"
             try:
                 out.append(svc.process_transfer(ctx.db, ctx.user, role, e))
@@ -348,23 +364,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def sync(body: SyncIn, ctx: Ctx = Depends(user_ctx)):
         db, u = ctx.db, ctx.user
         results = run_logs(ctx, body.logs)
+        more = len(body.logs) > SYNC_BATCH   # the phone sends the rest in its next round
+        svc.sudden_change(db, u, sum(1 for r in results if r.get("status") == "paid"))
         for r in body.reports[:50]:
             t = str(r.get("type", ""))
             if t in TRIPWIRES:
                 svc.event(db, t, "MEDIUM", u.id, str(r.get("pid", ""))[:20], str(r.get("description", ""))[:300], source="phone")
-        problems = svc.audit_wallet(db, u, ctx.device, body.wallet) if body.wallet else []
+        if body.wallet:
+            svc.note_counter(db, ctx.device, body.wallet)
+            problems = svc.audit_wallet(db, u, ctx.device, body.wallet)
+        else:  # leaving the snapshot out must not skip the audit silently
+            problems = ["wallet_omitted"]
+            svc.event(db, "wallet_omitted", "MEDIUM", u.id, "", "sync arrived without a wallet snapshot, so no restore or mine audit was possible", source="phone")
+        code_check = svc.check_build(db, u, body.code_digest)
+        cross = svc.ingest_cross_reports(db, u, ctx.device, body.cross_reports, problems)
         u.last_sync_at = now()
         db.add(Report(user_id=u.id, kind="sync", detail=json.dumps({"logs": len(body.logs), "reports": len(body.reports), "problems": problems})))
         db.commit()
         cur = svc.current_month(db)
         return {"results": results, "wallet_audit": problems, "server_time": now().isoformat(),
                 "wallet": wallet_view(db, u, ctx.device), "rules": svc.rules_doc(db, cur), "notices": svc.notices_doc(db),
-                "trust": svc.trust_doc(db, u)}
+                "trust": svc.trust_doc(db, u, ctx.device), "cross_reports": cross, "more": more, "code_check": code_check}
 
     @app.post("/claims")
     def claims(body: ClaimsIn, ctx: Ctx = Depends(user_ctx)):
         res = []
-        for e in body.claims[:500]:
+        for e in body.claims[:2500]:
             try:
                 res.append(svc.process_transfer(ctx.db, ctx.user, "claimant", e))
             except Rejected as r:
@@ -407,7 +432,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/trust/certificate")
     def trust_cert(ctx: Ctx = Depends(user_ctx)):
-        return svc.trust_doc(ctx.db, ctx.user)
+        return svc.trust_doc(ctx.db, ctx.user, ctx.device)
 
     @app.post("/integrity/verify")
     def integrity(body: IntegrityIn, ctx: Ctx = Depends(user_ctx)):
@@ -426,6 +451,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 svc.event(ctx.db, "code_check", "HIGH", ctx.user.id, "", "code block digest does not match the official build")
                 ctx.db.commit()
         return out
+
+    # ---------- selfie (team demo only) ----------
+    # Stored as a file in the gitignored data folder (backend/data/selfies). No face matching is built or claimed.
+    def selfie_path(u: User):
+        d = st.data_dir / "selfies"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"user{u.id}.jpg"
+
+    @app.get("/selfie/status")
+    def selfie_status(ctx: Ctx = Depends(user_ctx)):
+        return {"stored": selfie_path(ctx.user).exists()}
+
+    @app.post("/selfie")
+    def selfie_put(body: SelfieIn, ctx: Ctx = Depends(user_ctx)):
+        if not body.consent:
+            bad("consent_required")
+        m = re.match(r"^data:image/jpeg;base64,([A-Za-z0-9+/=]+)$", body.image)
+        raw = base64.b64decode(m.group(1)) if m else b""
+        if not raw or len(raw) > 400_000 or raw[:3] != b"\xff\xd8\xff":
+            bad("bad_image")
+        p = selfie_path(ctx.user)
+        p.write_bytes(raw)
+        p.chmod(0o600)
+        svc.audit(ctx.db, ctx.user.phone, "USER", "SELFIE_STORED", "demo selfie, consent given", "")
+        ctx.db.commit()
+        return {"stored": True}
+
+    @app.delete("/selfie")
+    def selfie_delete(ctx: Ctx = Depends(user_ctx)):
+        p = selfie_path(ctx.user)
+        existed = p.exists()
+        if existed:
+            p.unlink()
+        svc.audit(ctx.db, ctx.user.phone, "USER", "SELFIE_DELETED", "", "")
+        ctx.db.commit()
+        return {"stored": False, "deleted": existed}
 
     # ---------- reports and appeals ----------
     @app.post("/reports")
@@ -519,6 +580,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             out.append({"id": u.id, "name": u.name, "phone": u.phone, "kyc_status": u.kyc_status, "bank": u.bank, "region": u.region,
                         "main_balance": u.main_balance, "send_bucket": u.send_bucket, "receive_bucket": u.receive_bucket, "trust": score,
                         "offline_suspended": u.offline_suspended, "suspend_reason": u.suspend_reason, "last_sync_at": iso(u.last_sync_at),
+                        "selfie_on_file": (st.data_dir / "selfies" / f"user{u.id}.jpg").exists(),
                         "devices": [{"label": d.label, "active": d.active, "cancel_reason": d.cancel_reason} for d in devs]})
         return {"users": out}
 
@@ -556,7 +618,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             out.append({"pid": p.pid, "month": p.month, "owner": users[p.owner_id].name, "owner_phone": users[p.owner_id].phone, "owner_device": dev.label,
                         "outcome": "automatic: first report paid, later claims held, traced to owner",
                         "claimants": [{"name": users[r.to_user_id].name, "phone": users[r.to_user_id].phone, "status": r.status, "reason": r.reason,
-                                       "at": iso(r.settled_at or r.created_at), "trust": svc.trust(db, users[r.to_user_id])[0]} for r in rows]})
+                                       "at": iso(r.settled_at or r.created_at), "trust": svc.trust(db, users[r.to_user_id])[0],
+                                       "review_within_hours": svc.review_hours(svc.trust(db, users[r.to_user_id])[0]) if r.status == "held" else None} for r in rows]})
         return {"cases": out}
 
     @app.get("/admin/review")
@@ -612,7 +675,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db = ctx.db
         cur = svc.current_month(db)
         return {"month": cur, "previous_month": svc.prev_month(cur), "previous_in_grace": svc.month_valid(db, svc.prev_month(cur)),
-                "grace_days": st.grace_days, "rotated_at": iso(svc.rotated_at(db)), "send_limit": st.send_limit, "receive_limit": st.receive_limit,
+                "grace_days": st.grace_days, "rotated_at": iso(svc.rotated_at(db)), "send_limit": st.send_limit, "receive_limit": st.receive_limit, "topup_fee": st.topup_fee,
                 "bad_id_notices": db.scalar(select(func.count()).select_from(Notice)), "bank_public_key": svc.pub_b64,
                 "points_issued_this_month": db.scalar(select(func.count()).select_from(Point).where(Point.month == cur)),
                 "secrets": "seed and signing key are held on the server only and are not displayed"}
@@ -701,18 +764,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"chain_intact": svc.audit_chain_ok(ctx.db),
                 "entries": [{"id": r.id, "at": iso(r.ts), "actor": r.actor, "role": r.role, "action": r.action, "target": r.target, "ip": r.ip} for r in rows]}
 
+    @app.get("/admin/cross-reports")
+    def a_cross(ctx: Ctx = Depends(admin_ctx)):
+        """Read-only. Mutual-check results phones recorded on each other. Evidence for review; nobody is suspended by these."""
+        db = ctx.db
+        users = {u.id: u for u in db.scalars(select(User))}
+        rows = db.scalars(select(CrossReport).order_by(CrossReport.id.desc()).limit(300)).all()
+        return {"reports": [{"id": r.id, "at": iso(r.created_at), "reporter": users[r.reporter_id].name, "subject_phone": r.subject_phone,
+                             "subject": users[r.subject_id].name if r.subject_id in users else None, "result": r.result, "codes": r.codes} for r in rows]}
+
+    if portal != "all":
+        always = {"/health", "/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"}
+        want_admin = portal == "admin"
+        app.router.routes = [r for r in app.router.routes
+                             if not hasattr(r, "path") or r.path in always or r.path.startswith("/admin") == want_admin]
     return app
 
 
-def create_site_app() -> FastAPI:
-    """API under /api plus the built web app (../dist) at /, so one HTTPS tunnel serves a phone completely."""
+def create_site_app(portal: str = "user") -> FastAPI:
+    """One portal = one website: its API under /api plus its own built web app (dist/user or dist/admin) at /."""
     from pathlib import Path
     from fastapi.staticfiles import StaticFiles
     from starlette.responses import FileResponse
 
-    site = FastAPI(title="NiPay site")
-    site.mount("/api", create_app())
-    dist = Path(__file__).resolve().parent.parent.parent / "dist"
+    site = FastAPI(title=f"NiPay {portal} site")
+    site.mount("/api", create_app(portal=portal))
+    dist = Path(__file__).resolve().parent.parent.parent / "dist" / portal
     if dist.exists():
         class SPA(StaticFiles):
             async def get_response(self, path, scope):

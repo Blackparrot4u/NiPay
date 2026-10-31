@@ -1,4 +1,7 @@
-@import "tailwindcss";
+@import "tailwindcss" source(none);
+@source "./";
+@source not "./admin";
+@source "../index.html";
 @keyframes fadein { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }
 html, body, #root { min-height: 100%; }
 body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Devanagari", sans-serif; -webkit-tap-highlight-color: transparent; }

@@ -7,5 +7,7 @@ createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictM
 
 // Offline after first load: the service worker caches the app shell. Needs HTTPS or localhost.
 if ('serviceWorker' in navigator && location.search.indexOf('nosw') < 0) {
-  addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => { /* no HTTPS: app still works online */ }));
+  // crypto.ts awaits libsodium, so this module can run after the window 'load' event already fired
+  const reg = () => navigator.serviceWorker.register('/sw.js').catch(() => { /* no HTTPS: app still works online */ });
+  if (document.readyState === 'complete') reg(); else addEventListener('load', reg);
 }

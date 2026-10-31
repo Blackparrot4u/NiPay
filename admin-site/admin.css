@@ -1,0 +1,6 @@
+@import "tailwindcss" source(none);
+@source "../src/admin";
+@source "../src/shared";
+html, body, #root { min-height: 100%; }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+@keyframes fadein { from { opacity: 0; transform: translateY(-12px); } to { opacity: 1; transform: none; } }

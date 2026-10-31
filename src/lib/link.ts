@@ -59,7 +59,7 @@ export class LinkSession {
     this.life = setTimeout(() => this.destroy(), LINK_TIMEOUT_MS);
     this.pc.addEventListener('connectionstatechange', () => { if (['failed', 'closed'].includes(this.pc.connectionState) && this.state !== 'destroyed') this.set('failed'); });
   }
-  private set(s: LinkState) { if (this.state === 'destroyed') return; this.state = s; this.onState(s); }
+  private set(s: LinkState) { if (this.state === 'destroyed') return; this.state = s; if (typeof localStorage !== 'undefined' && localStorage.getItem('nipay:debug')) console.log('link', this.role, s); this.onState(s); }
 
   /** Payer: makes the offer that goes into a QR. */
   async createOffer() {
@@ -133,6 +133,10 @@ export class LinkSession {
     } else if (kind === 1 && this.state === 'authenticated') this.onMessage(body);
     else this.rejected++;
   }
+  /** Bytes queued in the data channel: the transfer layer waits on this so a big payment does not flood it. */
+  buffered() { return this.dc?.bufferedAmount ?? 0; }
+  /** Test hook: cut the link as if the phones moved apart. */
+  simulateDrop() { try { this.dc?.close(); this.pc.close(); } catch { /* closed */ } this.set('failed'); }
   send(app: Uint8Array) { if (this.state === 'authenticated') this.raw(concat(new Uint8Array([1]), app)); }
   /** Test hook: a "third device" that does not know the key tries to inject a frame. */
   injectForgery() { if (this.dc?.readyState === 'open') this.dc.send(seal(randomBytes(32), 99, this.myDir, enc.encode('evil')) as any); }

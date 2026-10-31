@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from .config import Settings
 from .core.idsystem import Bank, make_id, sign_handover, verify_handover, verify_receipt, verify_sig
 from .core.wallet import Wallet, HardwareCounter, audit_mines, mine_recipe, rules_blob, sign_rules, sign_trust
-from .models import (AuditLog, Device, LedgerEntry, Notice, Point, ReviewItem, SecurityEvent, Setting,
+from .models import (AuditLog, CrossReport, Device, LedgerEntry, Notice, Point, ReviewItem, SecurityEvent, Setting,
                      SettlementBatch, Transfer, User, now)
 
 
@@ -41,7 +41,29 @@ class Svc:
         self.bank = Bank(seed=unb64(secrets_store["seed"]), signing=SigningKey(unb64(secrets_store["signing_key"])))
         self.pub_b64 = b64(bytes(self.bank.public))
 
+    # ---------- small settings store ----------
+    def get_setting(self, db, key: str, default: str | None = None) -> str | None:
+        row = db.get(Setting, key)
+        return row.value if row else default
+
+    def put_setting(self, db, key: str, value: str):
+        row = db.get(Setting, key)
+        if row:
+            row.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+
     # ---------- months ----------
+    CLAIM_MONTHS = 6  # an honest late claim stays valid for up to 6 months (phones still only accept the grace window offline)
+
+    def claim_month_ok(self, db, month: str) -> bool:
+        cur = self.current_month(db)
+        if len(month) != 7 or month > cur:
+            return False
+        y, m = int(month[:4]), int(month[5:])
+        cy, cm = int(cur[:4]), int(cur[5:])
+        return (cy * 12 + cm) - (y * 12 + m) <= self.CLAIM_MONTHS
+
     def current_month(self, db) -> str:
         row = db.get(Setting, "month_override")
         return row.value if row else datetime.now(timezone.utc).strftime("%Y-%m")
@@ -142,10 +164,23 @@ class Svc:
     def grant_test_funds(self, db, user: User):
         self.move(db, "test_funds", user, ref="fake money", main=self.s.test_funds, mint=-self.s.test_funds)
 
-    def topup(self, db, user: User, device: Device, amount: int) -> list:
+    def send_limit_for(self, db, device: Device | None) -> int:
+        """A phone without a hardware counter gets a lower limit instead of a mark. The browser demo's counter is simulated, so it counts as weak;
+        the demo setting keeps the full limit so the 2,000-point test can run (set NIPAY_WEAK_COUNTER_LIMIT lower for a stricter run)."""
+        kind = self.get_setting(db, f"counter:{device.id}", "none") if device is not None else "none"
+        return self.s.send_limit if kind == "hardware" else min(self.s.send_limit, self.s.weak_counter_send_limit)
+
+    def topup(self, db, user: User, device: Device, amount: int, unsynced_spent: int = 0) -> list:
         if amount <= 0:
             raise Rejected("bad_amount")
-        if user.send_bucket + amount > self.s.send_limit:
+        limit = self.send_limit_for(db, device)
+        # Points the phone already spent offline stay in send_bucket until their logs reach the bank, so counting them would stall a refill.
+        # The phone says how many it has spent but not yet synced; that only counts up to what the bank can see is outstanding, and the
+        # hard ceiling (twice the limit) bounds the bank's exposure if a phone lies. A false report is logged.
+        spent = max(0, min(int(unsynced_spent or 0), user.send_bucket))
+        if spent:
+            self.event(db, "topup_unsynced_spend", "LOW", user.id, "", f"refill with {spent} points spent offline and not yet synced")
+        if user.send_bucket - spent + amount > limit or user.send_bucket + amount > 2 * limit:
             raise Rejected("send_limit")
         if user.offline_suspended:
             raise Rejected("offline_suspended")
@@ -153,7 +188,7 @@ class Svc:
         has_control = db.scalar(select(func.count()).select_from(Point).where(
             Point.owner_id == user.id, Point.device_id == device.id, Point.kind == "control", Point.month == month))
         # ledger first: it raises before any ID exists if the money is not there
-        self.move(db, "topup", user, ref=f"{amount} points", main=-(amount + 1), send=amount, fees=1)
+        self.move(db, "topup", user, ref=f"{amount} points", main=-(amount + self.s.topup_fee), send=amount, fees=self.s.topup_fee)
         rules, out = self.bank.rules(month), []
         need = amount + (0 if has_control else 1)
         for i in range(need):
@@ -206,7 +241,7 @@ class Svc:
         pt = db.scalars(select(Point).where(Point.month == month, Point.pid == pid)).first()
         if pt is None:
             return fail("forged", "forged", "valid-looking signature on an ID the bank never issued")
-        if not self.month_valid(db, month):
+        if not self.claim_month_ok(db, month):
             return fail("expired")
         if pt.kind == "control":
             return fail("control_key", "control_key_leak", "control key appeared in a payment: the whole wallet list was copied")
@@ -252,8 +287,7 @@ class Svc:
         first = db.scalars(select(Transfer).where(Transfer.point_id == pt.id, Transfer.status == "paid")).first()
         if first is not None:
             return self._hold(db, pt, row, owner, to_user, "already_paid_to_someone_else")
-        if to_user.receive_bucket + 1 > self.s.receive_limit:
-            return {"status": "pending", "reason": "receive_bucket_full"}
+        overflow = to_user.receive_bucket + 1 > self.s.receive_limit  # full bucket: the claim keeps its place and is paid to the main account
         try:
             with db.begin_nested():
                 row.status, row.settled_at, row.reason = "paid", now(), "first_report"
@@ -263,7 +297,7 @@ class Svc:
             return self._hold(db, pt, row, owner, to_user, "already_paid_to_someone_else")
         if pt.status == "cancelled":
             # lost-phone wallet: no refund to the owner, but a real claim is still paid from what the bank kept
-            self.move(db, "claim_paid_lost", to_user, ref=pt.pid, pool=-1, recv=1, other=owner)
+            self.move(db, "claim_paid_lost", to_user, ref=pt.pid, pool=-1, **({"main": 1} if overflow else {"recv": 1}), other=owner)
             db.add(ReviewItem(type="LOST_PHONE_CLAIM", user_id=owner.id,
                               summary=f"A valid claim arrived on point {pt.pid[:6]}... from a wallet reported lost: the report may have been false."))
             self.event(db, "lost_phone_claim", "MEDIUM", owner.id, pt.pid, "claim on a wallet the owner reported lost")
@@ -272,8 +306,12 @@ class Svc:
             if owner.send_bucket < 1:
                 raise Rejected("owner_bucket_empty")
             owner.send_bucket -= 1
-            to_user.receive_bucket += 1
-            db.add(LedgerEntry(kind="claim_paid", user_id=owner.id, other_user_id=to_user.id, ref=pt.pid, d_send=-1, d_recv=1))
+            if overflow:
+                to_user.main_balance += 1
+                db.add(LedgerEntry(kind="claim_paid_main", user_id=owner.id, other_user_id=to_user.id, ref=pt.pid, d_send=-1, d_main=1))
+            else:
+                to_user.receive_bucket += 1
+                db.add(LedgerEntry(kind="claim_paid", user_id=owner.id, other_user_id=to_user.id, ref=pt.pid, d_send=-1, d_recv=1))
         pt.status = "spent"
         return {"status": "paid", "reason": "first_report"}
 
@@ -293,6 +331,35 @@ class Svc:
         return {"status": "held", "reason": reason}
 
     # ---------- phone wallet snapshot audit (mines, restore, foreign IDs) ----------
+    def note_counter(self, db, device: Device, snap: dict):
+        kind = str(snap.get("counter_kind", "none"))
+        self.put_setting(db, f"counter:{device.id}", kind if kind in ("hardware", "simulated-browser") else "none")
+
+    def check_seq(self, db, user: User, device: Device, seq) -> list:
+        """The sequence number is phone-supplied, so the bank keeps its own highest value per device: going backwards means a restored copy."""
+        if not isinstance(seq, int):
+            return []
+        key = f"seq:{device.id}"
+        last = int(self.get_setting(db, key, "-1"))
+        if seq < last:
+            self.event(db, "restore", "HIGH", user.id, "", f"wallet sequence {seq} is behind the bank's own record {last} for this device")
+            return ["restore"]
+        self.put_setting(db, key, str(seq))
+        return []
+
+    def check_build(self, db, user: User, digest: str) -> str:
+        """Per official build: the operator registers the digests of official builds. Missing or unknown digests are logged, never silently skipped."""
+        official = [d for d in (self.get_setting(db, "official_build_digest", "") or "").split(",") if d]
+        if not official:
+            return "no_official_build_registered"
+        if not digest:
+            self.event(db, "code_check", "MEDIUM", user.id, "", "sync arrived without a code digest although official builds are registered")
+            return "missing"
+        if digest not in official:
+            self.event(db, "code_check", "HIGH", user.id, "", "code digest does not match any official build")
+            return "mismatch"
+        return "match"
+
     def audit_wallet(self, db, user: User, device: Device, snap: dict) -> list:
         out = []
         month = self.current_month(db)
@@ -305,6 +372,7 @@ class Svc:
             if foreign:
                 out.append("forged")
                 self.event(db, "forged", "CRITICAL", user.id, foreign[0], f"{len(foreign)} IDs in the wallet were never issued to this device")
+        out += self.check_seq(db, user, device, snap.get("seq"))
         if snap.get("seq") is not None and snap.get("counter") is not None and snap["seq"] != snap["counter"]:
             out.append("restore")
             self.event(db, "restore", "HIGH", user.id, "", "wallet sequence behind the hardware counter: wallet was restored from a copy")
@@ -322,6 +390,25 @@ class Svc:
                 self.event(db, "landmine", "HIGH", user.id, "", "mine audit failed: malformed mines")
         return out
 
+    @staticmethod
+    def review_hours(trust: int) -> int:
+        """Held claims are looked at sooner when the claimant's trust is higher: 72 h at 300 down to 12 h at 850. Shown to reviewers; nothing is released automatically (the first report was already paid)."""
+        return round(72 - 60 * (max(300, min(850, trust)) - 300) / 550)
+
+    # ---------- sudden change (review only, never freezes anything) ----------
+    def sudden_change(self, db, user: User, paid_now: int) -> bool:
+        since = now() - timedelta(days=30)
+        before = db.scalar(select(func.count()).select_from(Transfer).where(
+            Transfer.status == "paid", Transfer.settled_at >= since, Transfer.settled_at < now() - timedelta(seconds=5),
+            (Transfer.from_user_id == user.id) | (Transfer.to_user_id == user.id))) or 0
+        typical_per_day = before / 30
+        if paid_now >= self.s.sudden_change_min and paid_now >= 5 * (typical_per_day + 1):
+            db.add(ReviewItem(type="SUDDEN_CHANGE", user_id=user.id,
+                              summary=f"{paid_now} points settled in one sync against about {typical_per_day:.1f} a day before. Review only: nothing is frozen and the money has moved."))
+            self.event(db, "sudden_change", "LOW", user.id, "", f"{paid_now} points settled in one sync (review item opened, no restriction)")
+            return True
+        return False
+
     # ---------- trust ----------
     def trust(self, db, user: User) -> tuple:
         since = max(now() - timedelta(days=183), user.trust_reset_at)
@@ -329,16 +416,65 @@ class Svc:
         paid = db.scalar(select(func.count()).select_from(Transfer).where(
             Transfer.status == "paid", Transfer.settled_at >= since, (Transfer.from_user_id == user.id) | (Transfer.to_user_id == user.id)))
         bad = db.scalar(select(func.count()).select_from(SecurityEvent).where(
-            SecurityEvent.user_id == user.id, SecurityEvent.created_at >= since, SecurityEvent.type != "lost_phone_claim"))
+            SecurityEvent.user_id == user.id, SecurityEvent.created_at >= since, SecurityEvent.type.notin_(("lost_phone_claim", "cross_check_fail", "cross_report_rejected", "sudden_change", "wallet_omitted", "topup_unsynced_spend", "code_check"))))
         held = db.scalar(select(func.count()).select_from(Transfer).where(
             Transfer.status == "held", Transfer.from_user_id == user.id, Transfer.settled_at >= since))
         score = 500 + min(120, age * 120 // 180) + min(100, paid * 5) - min(300, bad * 60) - min(200, held * 200)
         return max(300, min(850, score)), age
 
-    def trust_doc(self, db, user: User) -> dict:
+    CERT_DAYS = 40
+
+    def trust_doc(self, db, user: User, device: Device | None = None) -> dict:
+        """The signed certificate a phone shows to another phone: trust, limits, expiry, bound to the device key."""
         score, age = self.trust(db, user)
-        blob, sig = sign_trust(self.bank, user.phone, score, age, self.current_month(db))
+        extra = {"ls": self.s.send_limit, "lr": self.s.receive_limit, "x": int((now() + timedelta(days=self.CERT_DAYS)).timestamp())}
+        if device is not None:
+            extra["d"] = device.public_key
+        blob, sig = sign_trust(self.bank, user.phone, score, age, self.current_month(db), extra)
         return {"score": score, "age_days": age, "window_days": 183, "blob": b64(blob), "sig": b64(sig)}
+
+    # ---------- cross-reports (phone checks phone) ----------
+    @staticmethod
+    def cross_text(r: dict, reporter_phone: str) -> str:
+        return "xr1|" + "|".join([reporter_phone, str(r.get("subject", "")), str(r.get("subject_pk", "")), str(r.get("ts", "")), str(r.get("result", "")),
+                                  ",".join(r.get("codes", [])), str(r.get("nonce", "")), str(r.get("ri", ""))])
+
+    def ingest_cross_reports(self, db, user: User, device: Device, reports: list, wallet_problems: list) -> dict:
+        """Evidence only: stored, logged, queued for human review. Nothing here suspends or blocks anyone.
+        A report from a reporter whose own integrity check fails is refused and logged against the reporter."""
+        out = {"accepted": 0, "rejected": 0, "duplicate": 0}
+        for r in reports[:100]:
+            if not isinstance(r, dict):
+                continue
+            sig = str(r.get("sig", ""))
+            if not sig or db.scalars(select(CrossReport).where(CrossReport.sig == sig)).first():
+                out["duplicate"] += 1
+                continue
+            why = ""
+            try:
+                VerifyKey(unb64(device.public_key)).verify(self.cross_text(r, user.phone).encode(), unb64(sig))
+            except Exception:
+                why = "bad_signature"
+            if not why and (r.get("result") not in ("pass", "fail") or not isinstance(r.get("codes", []), list)):
+                why = "malformed"
+            if not why and str(r.get("subject", "")) == user.phone:
+                why = "self_report"
+            if not why and (str(r.get("ri", "")) != "1" or wallet_problems or not device.active):
+                why = "reporter_integrity_failed"
+            if why:
+                out["rejected"] += 1
+                self.event(db, "cross_report_rejected", "MEDIUM", user.id, "", f"cross-report refused ({why}) about {str(r.get('subject', ''))[:15]}", source="phone")
+                continue
+            subj = db.scalars(select(User).where(User.phone == str(r["subject"]))).first()
+            codes = ",".join(str(c)[:20] for c in r.get("codes", []))[:200]
+            db.add(CrossReport(reporter_id=user.id, subject_phone=str(r["subject"])[:20], subject_id=subj.id if subj else None, result=r["result"], codes=codes,
+                               ts=int(r.get("ts", 0) or 0), nonce=str(r.get("nonce", ""))[:40], sig=sig))
+            if r["result"] == "fail":
+                self.event(db, "cross_check_fail", "MEDIUM", subj.id if subj else None, "", f"{user.phone} reports failed mutual check [{codes}] at connection (log only)", source="phone")
+                if subj:
+                    db.add(ReviewItem(type="PEER_REPORT", user_id=subj.id, summary=f"mutual check failed [{codes}], reported by {user.phone}"))
+            out["accepted"] += 1
+        return out
 
     # ---------- flow map ----------
     def flow_map(self, db) -> dict:

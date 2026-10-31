@@ -4,8 +4,8 @@ import { Welcome, Signup, Login } from './screens/Auth';
 import { Home, TopUp, Move, History, More, useOnline } from './screens/Main';
 import { Pay } from './screens/Pay';
 import { Receive } from './screens/Receive';
-import { Checks, Inspect } from './screens/Checks';
-import { Admin } from './admin/Admin';
+import { Inspect } from './screens/Inspect';
+import { Selfie } from './screens/Selfie';
 import { Badge } from './ui';
 
 const useRoute = () => {
@@ -18,7 +18,6 @@ export default function App() {
   const route = useRoute(); const d = useDevice(); const online = useOnline();
   // any internet contact forces a ping: sync as soon as we are online and signed in
   useEffect(() => { if (online && d.token) syncNow(); }, [online, d.token]);
-  if (route.startsWith('/admin')) return <Admin page={route.split('/')[2] ?? 'overview'} />;
   const signedIn = !!d.token;
   let view;
   if (!signedIn && !['/signup', '/login'].includes(route)) view = <Welcome />;
@@ -31,7 +30,7 @@ export default function App() {
     case '/history': view = <History />; break;
     case '/move': view = <Move />; break;
     case '/more': view = <More />; break;
-    case '/checks': view = <Checks />; break;
+    case '/selfie': view = <Selfie />; break;
     case '/inspect': view = <Inspect />; break;
     default: view = <Home />;
   }
