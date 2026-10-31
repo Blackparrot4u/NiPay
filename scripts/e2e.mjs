@@ -12,9 +12,9 @@ const PORT = 8765, BASE = `http://127.0.0.1:${PORT}`;
 const SHOTS = join(homedir(), 'Pictures/offline-payments-flow/nipay-app'); mkdirSync(SHOTS, { recursive: true });
 const dataDir = mkdtempSync(join(tmpdir(), 'nipay-e2e-'));
 const server = spawn('uv', ['run', '--with-requirements', 'requirements.txt', 'python', '-m', 'nipay'], {
-  cwd: 'backend', env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', NIPAY_DATA_DIR: dataDir, NIPAY_RATE_LIMIT: '100000', NIPAY_LOGIN_RATE: '1000' }, stdio: 'pipe' });
+  cwd: 'backend', env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', NIPAY_DATA_DIR: dataDir, NIPAY_RATE_LIMIT: '100000', NIPAY_LOGIN_RATE: '1000' }, stdio: 'pipe', detached: true });
 let log = ''; server.stdout.on('data', (d) => (log += d)); server.stderr.on('data', (d) => (log += d));
-const stop = () => { try { server.kill('SIGTERM'); } catch {} };
+const stop = () => { try { process.kill(-server.pid, 'SIGTERM'); } catch {} };
 process.on('exit', stop);
 for (let i = 0; i < 60; i++) { try { if ((await fetch(BASE + '/api/health')).ok) break; } catch {} await new Promise((r) => setTimeout(r, 500)); }
 if (!(await fetch(BASE + '/api/health').then((r) => r.ok).catch(() => false))) { console.log('SERVER LOG', log); process.exit(2); }
