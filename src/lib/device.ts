@@ -20,12 +20,12 @@ export interface State {
   received: Held[]; sent: Held[];
   queuedReports: { type: string; pid: string; description: string }[];
   server: any | null; history: any[]; lastSync: string | null; lastSyncOk: boolean;
-  trace: string[];
+  trace: string[]; locked: boolean;
 }
 const empty = (): State => {
   const kp = newKeypair();
   return { seed: b64(kp.seed), pub: b64(kp.pub), token: null, phone: '', name: '', pinHash: '', pinSalt: '', language: 'en', bankPub: '', docs: [], notices: [], trust: null,
-    points: [], inflight: [], mines: [], seq: 0, received: [], sent: [], queuedReports: [], server: null, history: [], lastSync: null, lastSyncOk: false, trace: [] };
+    points: [], inflight: [], mines: [], seq: 0, received: [], sent: [], queuedReports: [], server: null, history: [], lastSync: null, lastSyncOk: false, trace: [], locked: false };
 };
 
 const slot = (typeof location !== 'undefined' && new URLSearchParams(location.search).get('slot')) || 'main';
@@ -112,6 +112,12 @@ export function addTopupPoints(points: StoredPoint[]) {
 /** Picks points in KT's spend order, locks them as in flight, and signs the handover to `to`. */
 export function prepareSpend(n: number, to: string, month: string): { pid: string; month: string; sig: Uint8Array; handover: Uint8Array }[] {
   const s = state;
+  // restore detection: the wallet sequence must equal the (simulated) hardware counter
+  if (s.locked || s.seq !== hwCounter()) {
+    if (!s.locked) queueReport('restore', '', 'wallet sequence behind the hardware counter: wallet was restored from a copy');
+    set({ locked: true });
+    throw new Error('locked');
+  }
   const free = new Set(spendable().filter((p) => p.month === month).map((p) => p.pid));
   const order = spendOrder(s.points.map((p) => p.pid), s.mines, controlKey()).filter((p) => free.has(p)).slice(0, n);
   if (order.length < n) throw new Error('not enough points');

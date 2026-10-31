@@ -41,7 +41,8 @@ export function Pay() {
     if (!month) return setErr(free < n ? `You hold only ${free} spendable points. Add points while online.` : 'Not enough points from one month. Add points while online.');
     if (!acceptableMonths().includes(month)) return setErr('Wallet expired: go online once.');
     const r = b64(randomBytes(6)).replace(/[^a-z0-9]/gi, 'x');
-    const pts = prepareSpend(n, card.phone, month);
+    let pts;
+    try { pts = prepareSpend(n, card.phone, month); } catch { return setErr(t('attention')); }
     const msg: Message = { type: 'payment', meta: { ref: r, month, from: d.phone, fromName: d.name, to: card.phone, ts: Date.now(), pk: d.pub }, points: pts.map((p) => ({ pid: p.pid, sig: p.sig, handover: p.handover })) };
     setRef(r); setSent(pts); setFrames(toFrames(encodeMessage(msg), 420)); setStep('show');
   };
